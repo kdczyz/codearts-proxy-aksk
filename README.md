@@ -19,19 +19,31 @@ Upstream endpoint: `https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat
 ## Upstream session limit
 
 Snap-access allows at most **3 concurrent sessions per AK/SK**. Exceeding it
-returns `TM.00001041`. The proxy handles this by:
+returns `TM.00001041` (as HTTP 400). The proxy handles this by:
 
-- capping concurrent upstream calls at 3 (a semaphore) with one session id per
-  in-flight call; sequential calls reuse one slot, so a single conversation
-  occupies exactly one slot;
-- retrying on `TM.00001041` with a fresh session id and growing delays
-  (up to 10 attempts, ~60 s total).
+- capping concurrent upstream calls at 2 (a semaphore) with one stable
+  session id per slot, leaving 1 slot free for other clients sharing the
+  account (e.g. CodeArts IDE); sequential calls reuse one slot, so a
+  single conversation occupies exactly one slot;
+- retrying on `TM.00001041` by reusing the SAME session id with growing
+  delays (5/10/15/20/30 s). Never minting a fresh id on retry: the server
+  lingers sessions ~60 s, so a fresh id counts as an extra session and
+  makes the limit worse.
 
 Sessions linger server-side for roughly 60 s after a burst, so a burst of more
 than 3 parallel calls may still take a while to drain. That is a server-side
 session TTL, not something the proxy can change. For more concurrency, use
 additional Huawei accounts (each has its own 3 slots) and round-robin between
 them.
+
+## Reasoning / thinking
+
+Huawei's models return `reasoning_content` alongside `content`. The proxy
+keeps `reasoning_content` as its own field (streaming deltas and the
+non-streaming message) so clients like DSH can show it as a separate
+thinking block; it is never merged into `content`. The only exception is
+the empty-content fallback: when a response has no `content` at all, the
+reasoning text is used as the content to avoid a "no content" error.
 
 ## Setup
 
