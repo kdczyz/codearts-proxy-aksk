@@ -300,6 +300,12 @@ class Handler(BaseHTTPRequestHandler):
                                     for ch in obj.get('choices') or []:
                                         if ch.get('finish_reason'):
                                             saw_finish = True
+                                        d = ch.get('delta') or {}
+                                        # reasoning-only delta: promote to content
+                                        if d.get('reasoning_content') and not d.get('content'):
+                                            d['content'] = d['reasoning_content']
+                                    # rewrite the line with the patched object
+                                    line = ('data: ' + json.dumps(obj, ensure_ascii=False) + '\n').encode()
                                 except Exception:
                                     pass
                         try:
@@ -362,6 +368,10 @@ class Handler(BaseHTTPRequestHandler):
                         content_parts = [ch['message']['content']]
                     elif 'delta' in ch and ch['delta'].get('content'):
                         content_parts.append(ch['delta']['content'])
+                    elif 'message' in ch and ch['message'].get('reasoning_content'):
+                        content_parts = [ch['message']['reasoning_content']]
+                    elif 'delta' in ch and ch['delta'].get('reasoning_content'):
+                        content_parts.append(ch['delta']['reasoning_content'])
                 except Exception:
                     pass
             if merged is None:
