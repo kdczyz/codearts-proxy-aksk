@@ -82,8 +82,11 @@ def sign(ak, sk, method, url, body_bytes):
 # request finishes, so rapid calls from any client sharing the account
 # stack up and hit the cap even when each client only has one conversation
 # open. Mitigations, all in this proxy:
-#   1. Cap concurrent upstream calls at 3 (a semaphore): the account's
-#      full cap, but each slot keeps a STABLE Session-Id that is reused
+#   1. Cap concurrent upstream calls at 2 (a semaphore): at most two
+#      sessions in parallel, leaving 1 of the account's 3-session cap
+#      (TM.00001041) free for other clients sharing the account
+#      (CodeArts IDE, etc.). Each slot keeps a STABLE Session-Id that
+#      is reused
 #      across sequential calls AND across TM.00001041 retries. The
 #      server counts a session as active for ~60s after its last
 #      request, so minting a fresh id on every retry stacks up toward
@@ -92,8 +95,8 @@ def sign(ak, sk, method, url, body_bytes):
 #   2. On TM.00001041, retry with a FRESH Session-Id and growing delay:
 #      a fresh id can land in a slot freed since the last attempt, while
 #      reusing a stuck id keeps failing. Up to 10 attempts (~60s total).
-_SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(3)]
-_SESSION_SEM = threading.Semaphore(3)
+_SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(2)]
+_SESSION_SEM = threading.Semaphore(2)
 _SESSION_LOCK = threading.Lock()
 SESSION_RETRIES = 5
 SESSION_RETRY_DELAYS = [5, 10, 15, 20, 30]
