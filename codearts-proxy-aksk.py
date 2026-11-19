@@ -385,10 +385,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if content_parts:
                 try:
-                    merged['choices'][0]['message'] = {
+                    _orig_msg = merged['choices'][0].get('message') or {}
+                    _new_msg = {
                         'role': 'assistant',
                         'content': ''.join(content_parts),
                     }
+                    # keep tool_calls: a model may return both content and
+                    # tool calls; dropping them breaks function calling.
+                    if _orig_msg.get('tool_calls'):
+                        _new_msg['tool_calls'] = _orig_msg['tool_calls']
+                    merged['choices'][0]['message'] = _new_msg
                     merged['choices'][0].pop('delta', None)
                     merged['choices'][0]['finish_reason'] = (
                         merged['choices'][0].get('finish_reason') or 'stop')
