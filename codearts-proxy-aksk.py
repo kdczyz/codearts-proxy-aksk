@@ -93,13 +93,14 @@ def sign(ak, sk, method, url, body_bytes):
 _SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(3)]
 _SESSION_SEM = threading.Semaphore(3)
 _SESSION_LOCK = threading.Lock()
-SESSION_RETRIES = 10
-SESSION_RETRY_DELAYS = [3, 3, 5, 5, 8, 8, 10, 10, 10, 10]
+SESSION_RETRIES = 5
+SESSION_RETRY_DELAYS = [3, 3, 5, 5, 8]
 
 
 def _acquire_slot():
-    """Take a free slot (blocking until one is free). Returns the slot dict."""
-    _SESSION_SEM.acquire()
+    """Take a free slot (up to 30s). Raises TimeoutError if all slots busy."""
+    if not _SESSION_SEM.acquire(timeout=30):
+        raise TimeoutError('no free session slot within 30s')
     with _SESSION_LOCK:
         for slot in _SESSION_SLOTS:
             if not slot['busy']:
@@ -116,7 +117,7 @@ def _release_slot(slot):
     _SESSION_SEM.release()
 
 
-def call_upstream(upstream_body, timeout=120):
+def call_upstream(upstream_body, timeout=60):
     """POST to snap-access with AK/SK signing + session headers.
 
     At most 3 upstream calls run concurrently (one per slot); a further
@@ -245,6 +246,9 @@ class Handler(BaseHTTPRequestHandler):
         upstream_body = json.dumps(req).encode()
         try:
             status, resp_headers, uresp = call_upstream(upstream_body)
+        except TimeoutError:
+            self._send_json(503, {'error': 'all upstream sessions busy, retry later'})
+            return
         except urllib.error.HTTPError as e:
             err_body = e.read()
             try:
@@ -266,19 +270,78 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-cache')
             self.send_header('Connection', 'keep-alive')
             self.end_headers()
+            saw_finish = False
+            last_id = None
+            last_model = None
+            buf = b''
             try:
                 while True:
                     chunk = uresp.read(4096)
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                    buf += chunk
+                    # process complete lines; keep a trailing partial line buffered
+                    while b'\n' in buf:
+                        line, buf = buf.split(b'\n', 1)
+                        line += b'\n'
+                        stripped = line.decode('utf-8', 'replace').strip()
+                        if stripped == 'data: [DONE]':
+                            # hold [DONE]: inject finish_reason first if needed
+                            continue
+                        if stripped.startswith('data:'):
+                            payload = stripped[5:].strip()
+                            if payload:
+                                try:
+                                    obj = json.loads(payload)
+                                    if obj.get('id'):
+                                        last_id = obj['id']
+                                    if obj.get('model'):
+                                        last_model = obj['model']
+                                    for ch in obj.get('choices') or []:
+                                        if ch.get('finish_reason'):
+                                            saw_finish = True
+                                except Exception:
+                                    pass
+                        try:
+                            self.wfile.write(line)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            raise
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            finally:
+                try:
+                    uresp.close()
+                except Exception:
+                    pass
+            if not saw_finish:
+                try:
+                    final = {'choices': [{'delta': {}, 'finish_reason': 'stop',
+                                          'index': 0}],
+                             'created': int(time.time()),
+                             'id': last_id or ('as-' + uuid.uuid4().hex[:12]),
+                             'model': last_model or MODEL,
+                             'object': 'chat.completion.chunk'}
+                    self.wfile.write(('data: ' + json.dumps(final) + '\n\n').encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            try:
+                self.wfile.write(b'data: [DONE]\n\n')
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         else:
             # Upstream returns SSE even for non-streaming requests: one or
             # more "data: {...}" lines. Collapse them into a single JSON object.
-            raw = uresp.read().decode('utf-8', 'replace')
+            try:
+                raw = uresp.read().decode('utf-8', 'replace')
+            finally:
+                try:
+                    uresp.close()
+                except Exception:
+                    pass
             merged = None
             content_parts = []
             for line in raw.splitlines():
@@ -319,6 +382,14 @@ class Handler(BaseHTTPRequestHandler):
                     merged['choices'][0].pop('delta', None)
                     merged['choices'][0]['finish_reason'] = (
                         merged['choices'][0].get('finish_reason') or 'stop')
+                except Exception:
+                    pass
+            else:
+                # upstream gave no content: still attach a finish_reason
+                try:
+                    if merged.get('choices'):
+                        merged['choices'][0]['finish_reason'] = (
+                            merged['choices'][0].get('finish_reason') or 'stop')
                 except Exception:
                     pass
             data = json.dumps(merged).encode()
