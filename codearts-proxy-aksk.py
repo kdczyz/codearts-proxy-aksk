@@ -300,10 +300,6 @@ class Handler(BaseHTTPRequestHandler):
                                     for ch in obj.get('choices') or []:
                                         if ch.get('finish_reason'):
                                             saw_finish = True
-                                        d = ch.get('delta') or {}
-                                        # reasoning-only delta: promote to content
-                                        if d.get('reasoning_content') and not d.get('content'):
-                                            d['content'] = d['reasoning_content']
                                     # rewrite the line with the patched object
                                     line = ('data: ' + json.dumps(obj, ensure_ascii=False) + '\n').encode()
                                 except Exception:
