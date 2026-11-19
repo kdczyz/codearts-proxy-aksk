@@ -1,0 +1,16 @@
+[Unit]
+Description=CodeArts snap-access AK/SK proxy (OpenAI compatible)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/usr/bin/python3 /home/ubuntu/codearts-proxy-aksk.py
+Restart=always
+RestartSec=3
+Environment=PROXY_HOST=0.0.0.0
+Environment=PROXY_PORT=18000
+
+[Install]
+WantedBy=multi-user.target
