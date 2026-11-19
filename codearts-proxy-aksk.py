@@ -96,7 +96,7 @@ _SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(3)]
 _SESSION_SEM = threading.Semaphore(3)
 _SESSION_LOCK = threading.Lock()
 SESSION_RETRIES = 5
-SESSION_RETRY_DELAYS = [3, 3, 5, 5, 8]
+SESSION_RETRY_DELAYS = [5, 10, 15, 20, 30]
 
 
 def _acquire_slot():
@@ -137,11 +137,12 @@ def call_upstream(upstream_body, timeout=60):
     slot = _acquire_slot()
     try:
         for attempt in range(SESSION_RETRIES):
-            # Reuse the slot's stable id for the first 3 attempts: the
-            # server lingers sessions ~60s, so a fresh id per retry
-            # inflates the distinct-session count toward the cap.
-            # Only after 3 same-id failures mint a fresh id.
-            session_id = slot['id'] if attempt < 3 else uuid.uuid4().hex
+            # ALWAYS reuse the slot's stable id, even on TM.00001041
+            # retries. The server lingers sessions ~60s, so a fresh id
+            # counts as an extra distinct session and makes the limit
+            # worse. Retrying the same id lets the lingering sessions
+            # expire without adding to the count.
+            session_id = slot['id']
             headers = sign(AK, SK, 'POST', SNAP_URL, upstream_body)
             # Session headers are added AFTER signing (they do not take part
             # in the SDK-HMAC-SHA256 canonical request), matching the
@@ -157,10 +158,23 @@ def call_upstream(upstream_body, timeout=60):
                 err_body = e.read()
                 last_err_body = err_body
                 last_err_code = e.code
+                try:
+                    err_text = err_body.decode('utf-8', 'replace')[:600]
+                except Exception:
+                    err_text = '<undecodable>'
+                try:
+                    _r = json.loads(upstream_body)
+                    _model = _r.get('model', '?')
+                    _nmsg = len(_r.get('messages', []) or [])
+                    _tools = 'tools' if _r.get('tools') else 'notools'
+                    _keys = ','.join(sorted(_r.keys()))
+                except Exception:
+                    _model, _nmsg, _tools, _keys = '?', -1, '?', '?'
+                print(f"[upstream-error] status={e.code} model={_model} nmsg={_nmsg} {_tools} keys={_keys} body={err_text}", flush=True)
                 if b'TM.00001041' in err_body and attempt < SESSION_RETRIES - 1:
                     delay = SESSION_RETRY_DELAYS[attempt]
                     print(f'session limit hit (attempt {attempt + 1}), '
-                          f'retrying with a fresh session in {delay}s',
+                          f'retrying same session in {delay}s',
                           file=sys.stderr, flush=True)
                     time.sleep(delay)
                     continue
