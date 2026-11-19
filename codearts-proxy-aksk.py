@@ -322,9 +322,9 @@ class Handler(BaseHTTPRequestHandler):
                                         if ch.get('finish_reason'):
                                             saw_finish = True
                                         d = ch.get('delta') or {}
-                                        # strip reasoning: MD must look like
-                                        # any other model (content only)
-                                        d.pop('reasoning_content', None)
+                                        # keep reasoning_content in the delta:
+                                        # DSH renders it as a separate thinking
+                                        # block; content stays clean.
                                     # rewrite the line with the patched object
                                     line = ('data: ' + json.dumps(obj, ensure_ascii=False) + '\n').encode()
                                 except Exception:
@@ -411,8 +411,13 @@ class Handler(BaseHTTPRequestHandler):
                         'role': 'assistant',
                         'content': ''.join(content_parts),
                     }
-                    # reasoning_content is stripped: MD looks like any
-                    # other model (content only, no thinking field)
+                    # keep reasoning_content as its own field so DSH
+                    # shows it as a thinking block; never merge it into
+                    # content. Skip it when content came from the
+                    # reasoning fallback (it IS the content already).
+                    _has_real_content = bool(_orig_msg.get('content'))
+                    if _has_real_content and _orig_msg.get('reasoning_content'):
+                        _new_msg['reasoning_content'] = _orig_msg['reasoning_content']
                     # keep tool_calls: a model may return both content and
                     # tool calls; dropping them breaks function calling.
                     if _orig_msg.get('tool_calls'):
