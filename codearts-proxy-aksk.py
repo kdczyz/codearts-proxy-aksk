@@ -82,16 +82,18 @@ def sign(ak, sk, method, url, body_bytes):
 # request finishes, so rapid calls from any client sharing the account
 # stack up and hit the cap even when each client only has one conversation
 # open. Mitigations, all in this proxy:
-#   1. Cap concurrent upstream calls at 2 (a semaphore): at most two
-#      sessions in parallel, leaving 1 of the account's 3-session cap
-#      (TM.00001041) free for other clients sharing the account
-#      (CodeArts IDE, etc.). 1 session serialized everything and 503d
-#      under any concurrency.
+#   1. Cap concurrent upstream calls at 3 (a semaphore): the account's
+#      full cap, but each slot keeps a STABLE Session-Id that is reused
+#      across sequential calls AND across TM.00001041 retries. The
+#      server counts a session as active for ~60s after its last
+#      request, so minting a fresh id on every retry stacks up toward
+#      the cap; reusing the same id keeps the distinct-session count
+#      at 3. A fresh id is minted only after 3 same-id retries fail.
 #   2. On TM.00001041, retry with a FRESH Session-Id and growing delay:
 #      a fresh id can land in a slot freed since the last attempt, while
 #      reusing a stuck id keeps failing. Up to 10 attempts (~60s total).
-_SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(2)]
-_SESSION_SEM = threading.Semaphore(2)
+_SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(3)]
+_SESSION_SEM = threading.Semaphore(3)
 _SESSION_LOCK = threading.Lock()
 SESSION_RETRIES = 5
 SESSION_RETRY_DELAYS = [3, 3, 5, 5, 8]
@@ -122,8 +124,9 @@ def call_upstream(upstream_body, timeout=60):
 
     At most 3 upstream calls run concurrently (one per slot); a further
     call waits for a free slot instead of opening a 4th session. Retries
-    on TM.00001041 (session limit) with a fresh Session-Id and growing
-    delay. Returns (status, headers_dict, response). Raises on transport
+    on TM.00001041 (session limit) reusing the same Session-Id first
+    (3 attempts) and only then a fresh one, with growing delay.
+    Returns (status, headers_dict, response). Raises on transport
     failure. Raises urllib.error.HTTPError for non-2xx that is not the
     session limit after retries are exhausted (caller reads the error
     body from it).
@@ -134,10 +137,11 @@ def call_upstream(upstream_body, timeout=60):
     slot = _acquire_slot()
     try:
         for attempt in range(SESSION_RETRIES):
-            # Normal calls reuse the slot's stable id; retries mint a fresh
-            # one so a stuck id does not keep failing while a freed slot
-            # exists.
-            session_id = slot['id'] if attempt == 0 else uuid.uuid4().hex
+            # Reuse the slot's stable id for the first 3 attempts: the
+            # server lingers sessions ~60s, so a fresh id per retry
+            # inflates the distinct-session count toward the cap.
+            # Only after 3 same-id failures mint a fresh id.
+            session_id = slot['id'] if attempt < 3 else uuid.uuid4().hex
             headers = sign(AK, SK, 'POST', SNAP_URL, upstream_body)
             # Session headers are added AFTER signing (they do not take part
             # in the SDK-HMAC-SHA256 canonical request), matching the
