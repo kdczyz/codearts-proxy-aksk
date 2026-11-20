@@ -45,6 +45,33 @@ thinking block; it is never merged into `content`. The only exception is
 the empty-content fallback: when a response has no `content` at all, the
 reasoning text is used as the content to avoid a "no content" error.
 
+## Daily sign-in (100 points/day)
+
+`codearts-daily-claim.py` claims the CodeArts daily sign-in (100 points,
+campaign 34, "每日签到领100积分") plus the new-user bonus (campaign 4) using
+the same permanent AK/SK — no OAuth login, no token renewal, no expiry.
+It talks to the snap-access ops endpoints with the same SDK-HMAC-SHA256
+signing as the proxy:
+
+- `GET /v1/ops/delivery?channel=IDE` — list available benefit campaigns
+- `POST /v1/ops/claim` — claim a campaign
+- `POST /v1/ops/confirm` — confirm the claim
+
+The daily campaign id is **34** (not 1). An earlier auto-claim tool
+(codearts2api) hardcoded campaign 1 for the daily sign-in, so it never
+claimed it — only the new-user bonus (campaign 4). This script matches the
+real ids.
+
+Run it by hand, or put it in cron (twice a day is harmless — an already
+claimed day just reports "已领取" and does nothing):
+
+```bash
+python3 codearts-daily-claim.py
+# cron: 30 0,12 * * * /usr/bin/python3 /path/to/codearts-daily-claim.py >> /path/to/codearts-daily-claim.log 2>&1
+```
+
+It reads the AK/SK from `codearts-aksk.json` (same file as the proxy).
+
 ## Setup
 
 Python 3, standard library only — no dependencies.
@@ -80,6 +107,7 @@ sudo systemctl enable --now codearts-proxy-aksk.service
 | `snap_models.json` | Model list served by `/v1/models` |
 | `test_all_models.py` | Smoke-test every model via the local proxy |
 | `codearts-proxy-aksk.service` | systemd unit |
+| `codearts-daily-claim.py` | Daily sign-in claim (100 pts/day) via AK/SK |
 | `codearts-aksk.json.example` | Credential template (placeholders only) |
 | `codearts-proxy-aksk.env.example` | Local-key template (placeholders only) |
 
