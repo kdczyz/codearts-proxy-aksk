@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Claim CodeArts daily sign-in (campaign 1) + new-user (campaign 4) via AK/SK.
+"""Claim every claimable CodeArts benefit campaign via AK/SK.
 
 Replicates codearts2api's check-in flow against snap-access, but signs with the
 permanent IAM AK/SK from /home/ubuntu/codearts-aksk.json instead of the OAuth
-token (codearts2api was deleted). Endpoints:
+token (codearts2api was deleted). It does NOT limit itself to the daily
+sign-in: every run it fetches all benefit campaigns and claims any that is
+ELIGIBLE + claimable (daily sign-in, new-user bonus, student monthly bonus,
+student certification bonus, competition rewards, ...). Endpoints:
   GET  /v1/ops/delivery?channel=IDE
   POST /v1/ops/claim   {campaignId, channel, idempotentKey}
   POST /v1/ops/confirm {campaignId}
 Signing: SDK-HMAC-SHA256 over ALL request headers (same as codearts2api).
+Already-claimed campaigns are left alone; a day that is already claimed just
+reports "已领取" and does nothing.
 """
 import hashlib
 import hmac
@@ -112,19 +117,37 @@ def main():
               f"pending={c.get('pendingTotalAmount')}")
 
     now_ms = int(time.time() * 1000)
+    now = datetime.now(timezone.utc)
     for c in items:
         cid = c.get("campaignId")
-        if cid not in (34, 4):
+        if cid is None:
             continue
         if c.get("benefitUnit") not in ("", "CREDIT"):
             continue
         st = (c.get("status") or "").strip()
         title = c.get("title") or f"活动 {cid}"
+        extra = c.get("extra") or {}
+        end = extra.get("endTime")
+        if end:
+            try:
+                if not now < datetime.fromisoformat(end.replace("Z", "+00:00")):
+                    print(f"[{title}] 活动已结束")
+                    continue
+            except ValueError:
+                pass
+        start = extra.get("startTime")
+        if start:
+            try:
+                if now < datetime.fromisoformat(start.replace("Z", "+00:00")):
+                    print(f"[{title}] 活动尚未开始")
+                    continue
+            except ValueError:
+                pass
         if st in ("CONFIRMED", "CONSUMED"):
             print(f"[{title}] 已领取")
             continue
         if st == "CLAIMED":
-            pass  # fall through to confirm
+            pass  # claimed but not confirmed yet; fall through to confirm
         elif st == "ELIGIBLE":
             if not c.get("claimable"):
                 print(f"[{title}] 暂不可领取，稍后重试")

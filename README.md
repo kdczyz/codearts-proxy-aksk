@@ -45,11 +45,17 @@ thinking block; it is never merged into `content`. The only exception is
 the empty-content fallback: when a response has no `content` at all, the
 reasoning text is used as the content to avoid a "no content" error.
 
-## Daily sign-in (100 points/day)
+## Daily benefit claimer (all campaigns)
 
-`codearts-daily-claim.py` claims the CodeArts daily sign-in (100 points,
-campaign 34, "每日签到领100积分") plus the new-user bonus (campaign 4) using
-the same permanent AK/SK — no OAuth login, no token renewal, no expiry.
+`codearts-daily-claim.py` claims **every** claimable CodeArts benefit campaign
+with the same permanent AK/SK — no OAuth login, no token renewal, no expiry.
+Each run fetches all campaigns from the snap-access ops endpoint and claims
+any that is `ELIGIBLE` + claimable: the daily sign-in (100 points, campaign
+34), the new-user bonus (campaign 4), the student monthly bonus (5000
+points/month, campaign 39), the student certification bonus (4000 points,
+campaign 2), competition rewards, and anything new that shows up later.
+Already-claimed campaigns are left alone.
+
 It talks to the snap-access ops endpoints with the same SDK-HMAC-SHA256
 signing as the proxy:
 
@@ -57,10 +63,11 @@ signing as the proxy:
 - `POST /v1/ops/claim` — claim a campaign
 - `POST /v1/ops/confirm` — confirm the claim
 
-The daily campaign id is **34** (not 1). An earlier auto-claim tool
+Note: the daily campaign id is **34** (not 1). An earlier auto-claim tool
 (codearts2api) hardcoded campaign 1 for the daily sign-in, so it never
 claimed it — only the new-user bonus (campaign 4). This script matches the
-real ids.
+real ids and, more importantly, does not hardcode any id at all: it claims
+whatever the delivery endpoint reports as eligible.
 
 Run it by hand, or put it in cron (twice a day is harmless — an already
 claimed day just reports "已领取" and does nothing):
@@ -71,6 +78,10 @@ python3 codearts-daily-claim.py
 ```
 
 It reads the AK/SK from `codearts-aksk.json` (same file as the proxy).
+Some campaigns need a qualification first (e.g. the student bonuses need
+student certification on the Huawei account); those show as "未获得活动资格"
+until the certification takes effect, and the script picks them up
+automatically once they become eligible.
 
 ## Setup
 
@@ -107,7 +118,7 @@ sudo systemctl enable --now codearts-proxy-aksk.service
 | `snap_models.json` | Model list served by `/v1/models` |
 | `test_all_models.py` | Smoke-test every model via the local proxy |
 | `codearts-proxy-aksk.service` | systemd unit |
-| `codearts-daily-claim.py` | Daily sign-in claim (100 pts/day) via AK/SK |
+| `codearts-daily-claim.py` | Daily benefit claimer (all campaigns) via AK/SK |
 | `codearts-aksk.json.example` | Credential template (placeholders only) |
 | `codearts-proxy-aksk.env.example` | Local-key template (placeholders only) |
 
