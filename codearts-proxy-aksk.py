@@ -150,7 +150,13 @@ def call_upstream(upstream_body, timeout=60):
             # Session headers are added AFTER signing (they do not take part
             # in the SDK-HMAC-SHA256 canonical request), matching the
             # reference client.
-            headers['Chat-Id'] = uuid.uuid4().hex
+            # Chat-Id is FIXED per slot (same as Session-Id), NOT a fresh
+            # uuid per request: the server counts a fresh Chat-Id as a
+            # new session, so rapid calls stacked up past the 3-session
+            # cap (TM.00001041) even with a single stable Session-Id.
+            # Reusing one id per slot keeps the distinct-session count
+            # at most 3 no matter how fast calls arrive.
+            headers['Chat-Id'] = session_id
             headers['Session-Id'] = session_id
             headers['lang'] = 'en'
             ureq = urllib.request.Request(SNAP_URL, data=upstream_body, headers=headers, method='POST')
