@@ -95,8 +95,8 @@ def sign(ak, sk, method, url, body_bytes):
 #   2. On TM.00001041, retry with a FRESH Session-Id and growing delay:
 #      a fresh id can land in a slot freed since the last attempt, while
 #      reusing a stuck id keeps failing. Up to 10 attempts (~60s total).
-_SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(2)]
-_SESSION_SEM = threading.Semaphore(2)
+_SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(1)]
+_SESSION_SEM = threading.Semaphore(1)
 _SESSION_LOCK = threading.Lock()
 SESSION_RETRIES = 5
 SESSION_RETRY_DELAYS = [5, 10, 15, 20, 30]
