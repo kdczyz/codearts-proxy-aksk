@@ -13,6 +13,7 @@ Endpoints: POST /v1/chat/completions, POST /chat/completions,
 GET /v1/models, GET /models, GET /healthz.
 Streams SSE through chunk-by-chunk when the client asks stream:true.
 """
+import collections
 import hashlib
 import hmac
 import json
@@ -95,11 +96,42 @@ def sign(ak, sk, method, url, body_bytes):
 #   2. On TM.00001041, retry with a FRESH Session-Id and growing delay:
 #      a fresh id can land in a slot freed since the last attempt, while
 #      reusing a stuck id keeps failing. Up to 10 attempts (~60s total).
+#   3. Global throttle: at most 3 upstream sends per 60s (sliding window,
+#      _throttle_wait). Upstream counts each request as a session, so this
+#      is the only thing that actually stops 1041; stable ids alone do not.
 _SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(3)]
 _SESSION_SEM = threading.Semaphore(3)
 _SESSION_LOCK = threading.Lock()
 SESSION_RETRIES = 5
 SESSION_RETRY_DELAYS = [5, 10, 15, 20, 30]
+
+# Global throttle (mitigation 3): at most 3 upstream requests per 60s,
+# sliding window. Upstream counts EVERY request as a session lingering
+# ~60s, so >3 sends in 60s trips TM.00001041 even with stable Session-Ids.
+# This queues (waits) instead of erroring, so 1041 stops; bursts still
+# wait for the oldest session to expire. Per-token output speed is
+# unchanged once generation starts; only the start is delayed when the
+# window is full.
+_THROTTLE_WINDOW = 60.0
+_THROTTLE_MAX = 3
+_THROTTLE_TIMES = collections.deque()
+_THROTTLE_LOCK = threading.Lock()
+
+
+def _throttle_wait():
+    """Block until one more upstream send stays within 3 per 60s."""
+    import sys as _sys
+    while True:
+        with _THROTTLE_LOCK:
+            now = time.monotonic()
+            while _THROTTLE_TIMES and now - _THROTTLE_TIMES[0] >= _THROTTLE_WINDOW:
+                _THROTTLE_TIMES.popleft()
+            if len(_THROTTLE_TIMES) < _THROTTLE_MAX:
+                _THROTTLE_TIMES.append(now)
+                return
+            wait = _THROTTLE_WINDOW - (now - _THROTTLE_TIMES[0])
+        print(f'[throttle] window full (3/60s), waiting {wait:.1f}s', file=_sys.stderr, flush=True)
+        time.sleep(max(wait, 0.05))
 
 
 def _acquire_slot():
@@ -137,6 +169,10 @@ def call_upstream(upstream_body, timeout=60):
     import sys
     last_err_body = None
     last_err_code = None
+    # Throttle FIRST (no slot held while waiting): a request that waits
+    # ~60s for the window must not occupy one of the 3 session slots, or
+    # it starves every other request into a 30s slot timeout (503).
+    _throttle_wait()
     slot = _acquire_slot()
     try:
         for attempt in range(SESSION_RETRIES):
@@ -248,7 +284,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path in ('/healthz', '/health'):
             self._send_json(200, {'status': 'ok', 'model': MODEL, 'auth': 'aksk',
                                   'sessions': len(_SESSION_SLOTS),
-                                  'max_concurrent': len(_SESSION_SLOTS)})
+                                  'max_concurrent': len(_SESSION_SLOTS),
+                                  'throttle': f'{_THROTTLE_MAX}/{int(_THROTTLE_WINDOW)}s'})
         else:
             self._send_json(404, {'error': 'not found'})
 
