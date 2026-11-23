@@ -5,19 +5,23 @@ A mock upstream records the arrival time of every request, so we can assert
 the real invariant: at most MAX_PER_WINDOW sends per WINDOW seconds per
 account, including retries.
 """
+import importlib.util
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, 'codearts-proxy-aksk.py')
@@ -540,3 +544,104 @@ class WindowTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class _FakeResp:
+    def __init__(self, status=200):
+        self.status = status
+
+    def read(self, amt=None):
+        return b'{}'
+
+
+class _FakeConn:
+    def __init__(self, fail_with=None):
+        self.fail_with = fail_with
+        self.closed = False
+        self.sock = None
+        self.timeout = None
+        self.requests = 0
+        self.resp = _FakeResp(200)
+
+    def request(self, method, path, body=None, headers=None):
+        self.requests += 1
+        if self.fail_with is not None:
+            raise self.fail_with
+
+    def getresponse(self):
+        return self.resp
+
+    def close(self):
+        self.closed = True
+
+
+class _FakePool:
+    def __init__(self, conns):
+        self.conns = list(conns)
+        self.released = []
+
+    def acquire(self):
+        return self.conns.pop(0)
+
+    def release(self, conn):
+        self.released.append(conn)
+
+
+def _load_proxy_module(tmp):
+    aksk_path = os.path.join(tmp, 'aksk.json')
+    with open(aksk_path, 'w') as f:
+        json.dump([{'access_key_id': 'ak', 'secret_access_key': 'sk'}], f)
+    env_path = os.path.join(tmp, 'proxy.env')
+    with open(env_path, 'w') as f:
+        f.write('LOCAL_API_KEY=test-key\n')
+    env = {
+        'PROXY_AKSK_FILE': aksk_path,
+        'PROXY_ENV_FILE': env_path,
+        'PROXY_LOCK_FILE': os.path.join(tmp, 'proxy.lock'),
+        'PROXY_UPSTREAM_URL': 'http://127.0.0.1:9/api/v2/chat/completions',
+        'PROXY_HOST': '127.0.0.1',
+        'PROXY_PORT': '18099',
+        'PROXY_WINDOW_SECONDS': '60',
+        'PROXY_MAX_PER_WINDOW': '3',
+        'PROXY_MAX_WAIT_SECONDS': '120',
+        'PROXY_MAX_PER_SESSION': '1',
+        'PROXY_SESSION_KEY': 'auto',
+        'PROXY_SESSION_RETRIES': '0',
+        'PROXY_RETRY_DELAYS': '0.2',
+        'PROXY_UPSTREAM_TIMEOUT': '10',
+    }
+    with mock.patch.dict(os.environ, env):
+        spec = importlib.util.spec_from_file_location(
+            'proxy_under_test', SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    return mod
+
+
+class UpstreamRetryTests(unittest.TestCase):
+    def test_write_failure_retries_on_fresh_connection(self):
+        mod = _load_proxy_module(tempfile.mkdtemp(prefix='proxy-retry-'))
+        bad = _FakeConn(fail_with=ssl.SSLWantWriteError(
+            'The write operation timed out'))
+        good = _FakeConn()
+        mod.POOL = _FakePool([bad, good])
+        account = types.SimpleNamespace(ak='ak', sk='sk',
+                                        session_id='sess-1')
+        result = mod._post_upstream(account, b'{"model": "m"}')
+        self.assertIs(result._resp, good.resp)
+        self.assertEqual(good.requests, 1)
+        self.assertTrue(bad.closed, 'failed connection must be closed')
+        self.assertIsInstance(result, mod.PooledResponse)
+
+    def test_write_failure_twice_raises(self):
+        mod = _load_proxy_module(tempfile.mkdtemp(prefix='proxy-retry-'))
+        bad1 = _FakeConn(fail_with=ssl.SSLWantWriteError(
+            'The write operation timed out'))
+        bad2 = _FakeConn(fail_with=ssl.SSLWantWriteError(
+            'The write operation timed out'))
+        mod.POOL = _FakePool([bad1, bad2])
+        account = types.SimpleNamespace(ak='ak', sk='sk',
+                                        session_id='sess-1')
+        with self.assertRaises(ssl.SSLWantWriteError):
+            mod._post_upstream(account, b'{"model": "m"}')
+        self.assertTrue(bad1.closed and bad2.closed)

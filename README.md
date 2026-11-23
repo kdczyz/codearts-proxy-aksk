@@ -65,7 +65,11 @@ What the proxy does:
   gateway returns 504 (APIG.0203, backend timeout) at ~60 s, so the fallback
   gives up after `PROXY_NONSTREAM_TIMEOUT` (default 55 s) and switches to the
   queued streaming path, which survives past 60 s (measured 68.6 s) because
-  its chunks keep flowing; an upstream 504 does the same switch;
+  its chunks keep flowing; an upstream 504 does the same switch. A write to
+  a stale pooled TLS connection fails instantly with SSLWantWriteError ("The
+  write operation timed out", seen 3x on 2026-11-23 after long queue waits);
+  the proxy retries such a write once on a fresh connection instead of
+  returning 502;
 - queued requests are cancelled as soon as the client disconnects, and an
   in-flight upstream response is closed too, so the upstream stops generating
   and releases its session within ~200 ms;

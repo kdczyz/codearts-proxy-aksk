@@ -27,6 +27,7 @@ import json
 import os
 import select
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -512,9 +513,14 @@ def _post_upstream(account, body, timeout=None):
             resp = conn.getresponse()
             break
         except (http.client.RemoteDisconnected, ConnectionResetError,
-                BrokenPipeError):
+                BrokenPipeError, ssl.SSLWantWriteError) as e:
             # An idle keep-alive connection may have been closed by the
-            # upstream; retry once on a fresh connection.
+            # upstream; retry once on a fresh connection. SSLWantWriteError
+            # ("The write operation timed out") is how a write to such a
+            # stale TLS connection surfaces; it fired instantly after a long
+            # queue wait on 2026-11-23 and returned 502 before this retry.
+            print(f'[upstream] write failed ({type(e).__name__}), retrying '
+                  f'on a fresh connection', file=sys.stderr, flush=True)
             try:
                 conn.close()
             except Exception:
@@ -830,7 +836,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(e.code, {'error': {'message': 'upstream error',
                                                'type': 'server_error'}})
             return
-        except (TimeoutError, socket.timeout) as e:
+        except (TimeoutError, socket.timeout, ssl.SSLWantWriteError,
+                ssl.SSLWantReadError) as e:
             print(f'[fallback] non-stream timed out after '
                   f'{NONSTREAM_TIMEOUT:.0f}s, switching to streaming',
                   file=sys.stderr, flush=True)
@@ -840,7 +847,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             raw = uresp.read()
-        except (TimeoutError, socket.timeout):
+        except (TimeoutError, socket.timeout, ssl.SSLWantWriteError,
+                ssl.SSLWantReadError):
             print(f'[fallback] non-stream read timed out after '
                   f'{NONSTREAM_TIMEOUT:.0f}s, switching to streaming',
                   file=sys.stderr, flush=True)
