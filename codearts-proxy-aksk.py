@@ -754,6 +754,12 @@ class Handler(BaseHTTPRequestHandler):
                 'aux_accounts': len(AUX_ACCOUNTS),
                 'aux_max_chars': AUX_MAX_CHARS,
                 'used': [a.used(now) for a in ACCOUNTS],
+                # Requests currently being handled (streaming, fallback and
+                # queued). Deploy only when this is 0: host-side `ss` cannot
+                # see new-api's connections (they live in the container's
+                # net namespace), so it wrongly reported a quiet moment on
+                # 2026-11-23 and a restart killed a 4-minute DSH request.
+                'in_flight': _IN_FLIGHT,
                 'nonstream_fallback': NONSTREAM_FALLBACK,
                 'nonstream_timeout': NONSTREAM_TIMEOUT,
                 'max_wait_seconds': MAX_WAIT,
