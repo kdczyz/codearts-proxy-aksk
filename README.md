@@ -76,10 +76,12 @@ What the proxy does:
   in-flight upstream response is closed too, so the upstream stops generating
   and releases its session within ~200 ms;
 - graceful shutdown: on SIGTERM the server stops accepting, waits for
-  in-flight requests to finish (at most 60 s), then exits, so a
+  in-flight requests to finish (at most 180 s), then exits, so a
   `systemctl restart` no longer kills a request mid-generation (that used
-  to surface as new-api 500 "do request failed: EOF"); deploy during a
-  quiet moment anyway, so the drain is normally empty;
+  to surface as new-api 500 "do request failed: EOF"); the drain cap must
+  stay below systemd's TimeoutStopSec (drop-in, 200 s). Deploy during a
+  quiet moment anyway (healthz `in_flight` == 0), so the drain is normally
+  empty; a 60 s cap once proved too short for a 129 s DSH generation;
 - one proxy process per lock file; a second instance exits instead of quietly
   doubling the request rate against the same AK/SK.
 

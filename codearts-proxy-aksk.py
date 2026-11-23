@@ -655,7 +655,9 @@ def _watch_client(conn, cancel, stop, on_gone=None):
 # in-flight requests to finish (at most _DRAIN_SECONDS), then exits.
 _IN_FLIGHT = 0
 _IN_FLIGHT_LOCK = threading.Lock()
-_DRAIN_SECONDS = 60.0
+# DSH's longest generations run ~130 s, so the drain must outlast them;
+# systemd's TimeoutStopSec (drop-in, 200 s) must stay above this cap.
+_DRAIN_SECONDS = 180.0
 _SHUTDOWN_REQUESTED = threading.Event()
 
 
