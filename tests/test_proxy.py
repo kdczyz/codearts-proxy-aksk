@@ -702,6 +702,31 @@ class GracefulShutdownTests(unittest.TestCase):
                          'proxy must exit 0 after draining')
 
 
+class PoolLivenessTests(unittest.TestCase):
+    def test_sock_alive(self):
+        mod = _load_proxy_module(tempfile.mkdtemp(prefix='proxy-alive-'))
+        a, b = socket.socketpair()
+        try:
+            self.assertTrue(mod._sock_alive(a))
+            b.close()
+            self.assertFalse(mod._sock_alive(a))
+        finally:
+            a.close()
+
+    def test_acquire_discards_dead_pooled_connection(self):
+        mod = _load_proxy_module(tempfile.mkdtemp(prefix='proxy-alive-'))
+        pool = mod.ConnectionPool('127.0.0.1', 443, True)
+        a, b = socket.socketpair()
+        dead = _FakeConn()
+        dead.sock = a
+        pool.idle.append(dead)
+        b.close()  # peer closed: the pooled socket is now readable (FIN)
+        conn = pool.acquire()
+        self.assertIsNot(conn, dead)
+        self.assertTrue(dead.closed)
+        a.close()
+
+
 class UpstreamRetryTests(unittest.TestCase):
     def test_write_failure_retries_on_fresh_connection(self):
         mod = _load_proxy_module(tempfile.mkdtemp(prefix='proxy-retry-'))

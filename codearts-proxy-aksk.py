@@ -405,6 +405,23 @@ _UPSTREAM = urlparse(SNAP_URL)
 _UPSTREAM_PATH = _UPSTREAM.path + (f'?{_UPSTREAM.query}' if _UPSTREAM.query else '')
 
 
+def _sock_alive(sock):
+    """True if a pooled socket looks usable. A non-blocking select that
+    finds the socket readable means the peer sent something; for an idle
+    keep-alive connection that is a FIN, i.e. the peer already closed it.
+    Handing such a connection out is the root cause of the stale-connection
+    502s: the POST write succeeds into the void and the read then hangs
+    until the 300 s socket timeout (seen 2026-11-23 18:16, 18:23, 18:38 and
+    18:43, each exactly 5m0s, and DSH's pi-ai client gives up at the same
+    300 s). A half-open connection whose FIN was lost still passes this
+    check; the first-byte timeout in _post_upstream catches those."""
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        return not readable
+    except Exception:
+        return False
+
+
 class ConnectionPool:
     """Keep-alive pool for upstream TLS connections.
 
@@ -425,7 +442,7 @@ class ConnectionPool:
         with self.lock:
             while self.idle:
                 conn = self.idle.pop()
-                if conn.sock is not None:
+                if conn.sock is not None and _sock_alive(conn.sock):
                     return conn
                 try:
                     conn.close()
