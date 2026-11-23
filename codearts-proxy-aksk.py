@@ -79,16 +79,28 @@ LISTEN_HOST = cfg('PROXY_HOST', '0.0.0.0')
 LISTEN_PORT = int(cfg('PROXY_PORT', '18000'))
 LOCAL_API_KEY = cfg('LOCAL_API_KEY', '')
 
-# Upstream allows 3 live sessions per AK/SK. Default to 2 so the proxy always
-# leaves one slot for other clients on the same account (IDE, CLI, ...) and
-# never fills the account by itself.
+# Upstream allows 3 live sessions per AK/SK. A conversation is serialized
+# below, so filling 3 no longer lets one conversation take them all. Set 2
+# to leave a slot for other clients sharing the account (IDE, CLI, ...).
 WINDOW = float(cfg('PROXY_WINDOW_SECONDS', '60'))
 MAX_PER_WINDOW = max(1, int(cfg('PROXY_MAX_PER_WINDOW', '3')))
+# Serialize one client conversation so its companion requests (title, summary,
+# suggestions) cannot occupy several upstream sessions at once. 0 disables it.
+MAX_PER_SESSION = max(0, int(cfg('PROXY_MAX_PER_SESSION', '1')))
 # How long a client request may wait for a session lease before 429. 0 = no cap.
 MAX_WAIT = float(cfg('PROXY_MAX_WAIT_SECONDS', '120'))
-# Retries on TM.00001041. Each retry consumes another session lease, so keep
-# this small; 1 means "one extra attempt after the first failure".
-RETRIES = max(0, int(cfg('PROXY_SESSION_RETRIES', '1')))
+# Retries on TM.00001041. A retry costs another lease and another window slot,
+# so the default is no retry: surface 429 and let the client back off.
+RETRIES = max(0, int(cfg('PROXY_SESSION_RETRIES', '0')))
+# Auxiliary requests (title/summary/suggestions) are routed to aux_accounts
+# when configured, so they never compete with the main conversation.
+AUX_MAX_TOKENS = max(0, int(cfg('PROXY_AUX_MAX_TOKENS', '256')))
+AUX_KEYWORDS = tuple(
+    item.strip().lower()
+    for item in cfg('PROXY_AUX_KEYWORDS',
+                    'title,summary,suggest,follow-up,标题,摘要,推荐,续写建议').split(',')
+    if item.strip()
+)
 RETRY_DELAYS = [
     float(x) for x in cfg('PROXY_RETRY_DELAYS', '5,15').split(',') if x.strip()
 ]
@@ -163,23 +175,33 @@ def load_accounts(path):
     with open(path) as f:
         data = json.load(f)
     if isinstance(data, dict) and 'accounts' in data:
-        items = data['accounts']
+        primary_items = data['accounts']
+        aux_items = data.get('aux_accounts') or []
     elif isinstance(data, list):
-        items = data
+        primary_items = data
+        aux_items = []
     else:
-        items = [data]
-    accounts = []
-    for item in items:
-        ak = item.get('access_key_id') or item.get('ak')
-        sk = item.get('secret_access_key') or item.get('sk')
-        if ak and sk:
-            accounts.append(Account(ak, sk))
-    if not accounts:
+        primary_items = [data]
+        aux_items = []
+
+    def build(items):
+        out = []
+        for item in items:
+            ak = item.get('access_key_id') or item.get('ak')
+            sk = item.get('secret_access_key') or item.get('sk')
+            if ak and sk:
+                out.append(Account(ak, sk))
+        return out
+
+    primary = build(primary_items)
+    aux = build(aux_items)
+    if not primary:
         raise SystemExit(f'no valid access_key_id/secret_access_key in {path}')
-    return accounts
+    return primary, aux
 
 
-ACCOUNTS = load_accounts(AKSK_PATH)
+PRIMARY_ACCOUNTS, AUX_ACCOUNTS = load_accounts(AKSK_PATH)
+ACCOUNTS = PRIMARY_ACCOUNTS + AUX_ACCOUNTS
 ACTIVE = threading.BoundedSemaphore(MAX_ACTIVE)
 
 
@@ -204,8 +226,9 @@ def _sleep_cancellable(seconds, cancel):
         time.sleep(min(left, 0.2))
 
 
-def reserve_send(cancel=None):
-    """Block until one account has a free session lease, then take it."""
+def reserve_send(accounts=None, cancel=None):
+    """Block until one account in the pool has a free lease, then take it."""
+    accounts = accounts or PRIMARY_ACCOUNTS
     start = time.monotonic()
     last_log = start
     while True:
@@ -213,7 +236,7 @@ def reserve_send(cancel=None):
             raise ClientGone()
         now = time.monotonic()
         waits = []
-        for account in ACCOUNTS:
+        for account in accounts:
             wait = account.try_reserve(now)
             if wait <= 0:
                 return account
@@ -228,6 +251,97 @@ def reserve_send(cancel=None):
                   file=sys.stderr, flush=True)
             last_log = now
         _sleep_cancellable(wait, cancel)
+
+
+_SESSION_STATE = {}
+_SESSION_STATE_LOCK = threading.Lock()
+
+
+def _session_key(req, headers):
+    """Identify the client conversation so its requests run one at a time."""
+    for name in ('X-Session-Id', 'Chat-Id', 'Session-Id',
+                 'X-Conversation-Id', 'Conversation-Id'):
+        value = headers.get(name) if headers else None
+        if value:
+            return value.strip()[:64]
+    for name in ('conversation_id', 'chat_id', 'session_id'):
+        value = req.get(name)
+        if value:
+            return str(value)[:64]
+    messages = req.get('messages') or []
+    if not messages:
+        return None
+    digest = hashlib.sha256()
+    for message in messages[:2]:
+        digest.update(str(message.get('role', '')).encode('utf-8'))
+        content = message.get('content')
+        if isinstance(content, str):
+            digest.update(content.encode('utf-8'))
+        else:
+            digest.update(json.dumps(content, sort_keys=True).encode('utf-8'))
+    return 'msgs-' + digest.hexdigest()[:16]
+
+
+def acquire_session(key, cancel=None):
+    """Take the per-conversation slot. Returns an entry for release_session."""
+    if not key or MAX_PER_SESSION <= 0:
+        return None
+    with _SESSION_STATE_LOCK:
+        state = _SESSION_STATE.get(key)
+        if state is None:
+            state = {'sem': threading.Semaphore(MAX_PER_SESSION), 'refs': 0}
+            _SESSION_STATE[key] = state
+        state['refs'] += 1
+        sem = state['sem']
+    acquired = False
+    try:
+        start = time.monotonic()
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise ClientGone()
+            if sem.acquire(timeout=0.2):
+                acquired = True
+                return (key, sem)
+            if MAX_WAIT > 0 and time.monotonic() - start >= MAX_WAIT:
+                raise QueueTimeout(WINDOW)
+    finally:
+        if not acquired:
+            with _SESSION_STATE_LOCK:
+                state = _SESSION_STATE.get(key)
+                if state is not None:
+                    state['refs'] -= 1
+                    if state['refs'] <= 0:
+                        _SESSION_STATE.pop(key, None)
+
+
+def release_session(entry):
+    if entry is None:
+        return
+    key, sem = entry
+    sem.release()
+    with _SESSION_STATE_LOCK:
+        state = _SESSION_STATE.get(key)
+        if state is not None:
+            state['refs'] -= 1
+            if state['refs'] <= 0:
+                _SESSION_STATE.pop(key, None)
+
+
+def _is_aux_request(req):
+    """Heuristic for title/summary/suggestion requests issued in parallel."""
+    messages = req.get('messages') or []
+    text = ''
+    for message in messages:
+        content = message.get('content')
+        if isinstance(content, str):
+            text += content.lower() + ' '
+    if AUX_KEYWORDS and any(word in text for word in AUX_KEYWORDS):
+        return True
+    if not AUX_MAX_TOKENS:
+        return False
+    limit = req.get('max_tokens') or req.get('max_completion_tokens')
+    return (isinstance(limit, int) and 0 < limit <= AUX_MAX_TOKENS
+            and len(messages) <= 2)
 
 
 _UPSTREAM = urlparse(SNAP_URL)
@@ -328,16 +442,28 @@ def _post_upstream(account, body):
     headers['Session-Id'] = account.session_id
     headers['lang'] = 'en'
     headers['Connection'] = 'keep-alive'
-    conn = POOL.acquire()
-    try:
-        conn.request('POST', _UPSTREAM_PATH, body=body, headers=headers)
-        resp = conn.getresponse()
-    except Exception:
+    for attempt in range(2):
+        conn = POOL.acquire()
         try:
-            conn.close()
+            conn.request('POST', _UPSTREAM_PATH, body=body, headers=headers)
+            resp = conn.getresponse()
+            break
+        except (http.client.RemoteDisconnected, ConnectionResetError,
+                BrokenPipeError):
+            # An idle keep-alive connection may have been closed by the
+            # upstream; retry once on a fresh connection.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if attempt:
+                raise
         except Exception:
-            pass
-        raise
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
     if resp.status >= 400:
         err_body = resp.read()
         try:
@@ -349,7 +475,7 @@ def _post_upstream(account, body):
     return PooledResponse(resp, conn)
 
 
-def call_upstream(body, cancel=None):
+def call_upstream(body, cancel=None, accounts=None):
     """Send one chat completion, queueing inside the per-account budget.
 
     Every send, including retries, goes through reserve_send first, so a retry
@@ -360,7 +486,7 @@ def call_upstream(body, cancel=None):
     attempts = 1 + RETRIES
     last = None
     for attempt in range(attempts):
-        account = reserve_send(cancel)
+        account = reserve_send(accounts, cancel)
         try:
             return account, _post_upstream(account, body)
         except urllib.error.HTTPError as e:
@@ -404,11 +530,35 @@ class _BodyReader:
         pass
 
 
-def _watch_client(conn, cancel, stop):
-    """Set cancel when the client closes the connection before we answer."""
+def _abort_response(resp):
+    """Close an in-flight upstream response so its server side stops early."""
+    conn = getattr(resp, '_conn', None)
+    sock = getattr(conn, 'sock', None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    try:
+        resp.close()
+    except Exception:
+        pass
+
+
+def _client_gone(cancel, on_gone):
+    cancel.set()
+    if on_gone is not None:
+        try:
+            on_gone()
+        except Exception:
+            pass
+
+
+def _watch_client(conn, cancel, stop, on_gone=None):
+    """Set cancel and abort upstream when the client goes away early."""
     while not stop.is_set() and not cancel.is_set():
         try:
-            readable, _, _ = select.select([conn], [], [], 0.5)
+            readable, _, _ = select.select([conn], [], [], 0.2)
             if not readable:
                 continue
             try:
@@ -416,13 +566,13 @@ def _watch_client(conn, cancel, stop):
             except (BlockingIOError, InterruptedError):
                 continue
             except OSError:
-                cancel.set()
+                _client_gone(cancel, on_gone)
                 return
             if data == b'':
-                cancel.set()
+                _client_gone(cancel, on_gone)
                 return
         except (OSError, ValueError):
-            cancel.set()
+            _client_gone(cancel, on_gone)
             return
 
 
@@ -473,6 +623,8 @@ class Handler(BaseHTTPRequestHandler):
                 'accounts': len(ACCOUNTS),
                 'window_seconds': WINDOW,
                 'max_per_window': MAX_PER_WINDOW,
+                'max_per_session': MAX_PER_SESSION,
+                'aux_accounts': len(AUX_ACCOUNTS),
                 'used': [a.used(now) for a in ACCOUNTS],
                 'max_wait_seconds': MAX_WAIT,
                 'max_active': MAX_ACTIVE,
@@ -493,15 +645,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         cancel = threading.Event()
         self._cancel_event = cancel
+        self._upstream_resp = None
         stop = threading.Event()
         watcher = threading.Thread(target=_watch_client,
-                                   args=(self.connection, cancel, stop), daemon=True)
+                                   args=(self.connection, cancel, stop,
+                                         self._abort_upstream), daemon=True)
         watcher.start()
         try:
             self._handle_completion()
         finally:
             stop.set()
             ACTIVE.release()
+
+    def _abort_upstream(self):
+        resp = getattr(self, '_upstream_resp', None)
+        if resp is not None:
+            _abort_response(resp)
 
     def _handle_completion(self):
         length = int(self.headers.get('Content-Length', 0))
@@ -514,46 +673,54 @@ class Handler(BaseHTTPRequestHandler):
         req.setdefault('model', MODEL)
         upstream_body = json.dumps(req).encode()
         cancel = getattr(self, '_cancel_event', None)
+        session = None
         try:
-            account, uresp = call_upstream(upstream_body, cancel)
-        except ClientGone:
-            return
-        except QueueTimeout as e:
-            self._send_json(429, {
-                'error': {'message': f'upstream session window full, retry after '
-                                     f'{max(1, int(e.wait))}s', 'type': 'rate_limit'},
-            }, headers={'Retry-After': max(1, int(e.wait))})
-            return
-        except urllib.error.HTTPError as e:
-            err_body = e.read()
-            if b'TM.00001041' in err_body:
-                self._send_json(429, {
-                    'error': {'message': 'upstream session limit (TM.00001041), retry later',
-                              'type': 'rate_limit', 'upstream': err_body.decode('utf-8', 'replace')},
-                }, headers={'Retry-After': max(1, int(WINDOW))})
-                return
             try:
-                self.send_response(e.code)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Length', str(len(err_body)))
-                self.end_headers()
-                self.wfile.write(err_body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            return
-        except Exception as e:
-            self._send_json(502, {'error': f'upstream error: {e}'})
-            return
+                session = acquire_session(_session_key(req, self.headers), cancel)
+                aux = _is_aux_request(req)
+                accounts = AUX_ACCOUNTS if (aux and AUX_ACCOUNTS) else PRIMARY_ACCOUNTS
+                account, uresp = call_upstream(upstream_body, cancel, accounts)
+            except ClientGone:
+                return
+            except QueueTimeout as e:
+                self._send_json(429, {
+                    'error': {'message': f'upstream session busy, retry after '
+                                         f'{max(1, int(e.wait))}s', 'type': 'rate_limit'},
+                }, headers={'Retry-After': max(1, int(e.wait))})
+                return
+            except urllib.error.HTTPError as e:
+                err_body = e.read()
+                if b'TM.00001041' in err_body:
+                    self._send_json(429, {
+                        'error': {'message': 'upstream session limit (TM.00001041), retry later',
+                                  'type': 'rate_limit',
+                                  'upstream': err_body.decode('utf-8', 'replace')},
+                    }, headers={'Retry-After': max(1, int(WINDOW))})
+                    return
+                try:
+                    self.send_response(e.code)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            except Exception as e:
+                self._send_json(502, {'error': f'upstream error: {e}'})
+                return
 
-        try:
-            if req.get('stream'):
-                self._relay_stream(uresp, cancel)
-            else:
-                self._relay_json(uresp)
+            self._upstream_resp = uresp
+            try:
+                if req.get('stream'):
+                    self._relay_stream(uresp, cancel)
+                else:
+                    self._relay_json(uresp, cancel)
+            finally:
+                self._upstream_resp = None
+                account.release(time.monotonic())
         finally:
-            # The upstream session stays alive for WINDOW seconds after the
-            # response ends, so the lease is only released here.
-            account.release(time.monotonic())
+            release_session(session)
 
     def _relay_stream(self, uresp, cancel):
         self.send_response(200)
@@ -602,6 +769,15 @@ class Handler(BaseHTTPRequestHandler):
                         if cancel is not None:
                             cancel.set()
                         return
+        except (BrokenPipeError, ConnectionResetError):
+            if cancel is not None:
+                cancel.set()
+            return
+        except Exception as exc:
+            if cancel is not None and cancel.is_set():
+                return
+            print(f'[stream-error] {exc}', file=sys.stderr, flush=True)
+            raise
         finally:
             try:
                 uresp.close()
@@ -624,9 +800,13 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _relay_json(self, uresp):
+    def _relay_json(self, uresp, cancel=None):
         try:
             raw = uresp.read().decode('utf-8', 'replace')
+        except Exception:
+            if cancel is not None and cancel.is_set():
+                return
+            raise
         finally:
             try:
                 uresp.close()

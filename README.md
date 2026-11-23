@@ -32,9 +32,10 @@ it can only stay inside it and queue politely.
 
 What the proxy does:
 
-- the default budget is 2 live sessions per account, not 3: the proxy never
-  fills the account on its own and always leaves one slot for another client
-  sharing the same AK/SK;
+- the default budget is 3 live sessions per account. A conversation is
+  serialized, so one chat cannot take all three; set
+  `PROXY_MAX_PER_WINDOW=2` to leave one slot for another client sharing the
+  same AK/SK;
 - one session lease per AK/SK: a request takes the lease *before* it is sent
   and keeps it until the response has been fully relayed. Only then does the
   lease start its `PROXY_WINDOW_SECONDS` (default 60) linger, matching the
@@ -45,8 +46,17 @@ What the proxy does:
 - a request that cannot get a slot within `PROXY_MAX_WAIT_SECONDS` (default 120)
   returns **HTTP 429** with `Retry-After` instead of hanging; set the client
   timeout above that value if you want the proxy to wait;
-- queued requests are cancelled as soon as the client disconnects, so an
-  abandoned request never consumes a slot;
+- each conversation is serialized (`PROXY_MAX_PER_SESSION=1`): a client that
+  sends the main reply plus title/summary/suggestion requests cannot occupy
+  several upstream sessions at once. The conversation key comes from
+  `X-Session-Id`/`Chat-Id`/`Session-Id`, then body ids, then a hash of the
+  first two messages;
+- auxiliary requests (small `max_tokens`, or prompts mentioning title/summary/
+  suggestion) are routed to `aux_accounts` when configured, so they never
+  compete with the main conversation;
+- queued requests are cancelled as soon as the client disconnects, and an
+  in-flight upstream response is closed too, so the upstream stops generating
+  and releases its session within ~200 ms;
 - one proxy process per lock file; a second instance exits instead of quietly
   doubling the request rate against the same AK/SK.
 
@@ -66,14 +76,32 @@ The proxy always sends through the account whose window frees up first. Two
 accounts give 6 requests / 60 s; this is the only way to really raise
 throughput.
 
+`aux_accounts` is a separate pool for companion requests (title, summary,
+suggestions). Put additional accounts there so the main conversation keeps the
+primary account to itself:
+
+```json
+{
+  "accounts": [
+    {"access_key_id": "AK1", "secret_access_key": "SK1"}
+  ],
+  "aux_accounts": [
+    {"access_key_id": "AK2", "secret_access_key": "SK2"}
+  ]
+}
+```
+
 ### Tuning
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PROXY_WINDOW_SECONDS` | `60` | linger after a response ends, per account |
-| `PROXY_MAX_PER_WINDOW` | `2` | max live sessions per account (in flight + linger); 2 leaves 1 slot free for other clients |
+| `PROXY_MAX_PER_WINDOW` | `3` | max live sessions per account (in flight + linger); set 2 to leave a slot for other clients |
+| `PROXY_MAX_PER_SESSION` | `1` | max in-flight requests per conversation (`0` disables serialization) |
 | `PROXY_MAX_WAIT_SECONDS` | `120` | max queue time before 429 (`0` = wait forever) |
-| `PROXY_SESSION_RETRIES` | `1` | retries on `TM.00001041` (each retry costs a slot) |
+| `PROXY_SESSION_RETRIES` | `0` | retries on `TM.00001041` (each retry costs a slot) |
+| `PROXY_AUX_MAX_TOKENS` | `256` | `max_tokens` at or below this marks a request as auxiliary |
+| `PROXY_AUX_KEYWORDS` | `title,summary,suggest,follow-up,标题,摘要,推荐,续写建议` | prompt keywords that mark a request as auxiliary |
 | `PROXY_RETRY_DELAYS` | `5,15` | backoff before each retry |
 | `PROXY_MAX_ACTIVE` | `64` | max concurrent client requests |
 | `PROXY_UPSTREAM_TIMEOUT` | `300` | upstream read timeout in seconds |
@@ -91,7 +119,9 @@ The proxy adds very little on its own:
 - streaming uses `read1`, so the first token is forwarded as soon as it
   arrives instead of waiting for a 4 KiB buffer;
 - SSE lines are forwarded verbatim, with no JSON re-encode;
-- the upstream queue polls every 100 ms, so a freed lease is picked up quickly.
+- the upstream queue polls every 100 ms, so a freed lease is picked up quickly;
+- a client disconnect closes the upstream socket, so a slow first token cannot
+  keep a session alive after the user pressed stop.
 
 If TTFB is still high, check in this order: `[queue]` lines in the log (waiting
 for a session lease, fixed by more accounts), then `time_appconnect` from
@@ -101,8 +131,9 @@ for a session lease, fixed by more accounts), then `time_appconnect` from
 ### If TM.00001041 still appears
 
 With the defaults the proxy cannot exceed the account by itself: one lease per
-in-flight response plus a 60 s linger, a hard cap of 2 live sessions, and a
-lock that refuses a second proxy process. If `TM.00001041` still shows up, the
+in-flight response plus a 60 s linger, a hard cap of 3 live sessions (one per
+conversation thanks to serialization), and a lock that refuses a second
+proxy process. If `TM.00001041` still shows up, the
 same AK/SK is being used somewhere else: CodeArts IDE, the CLI, a leftover
 proxy process, or the daily-claim cron.
 
@@ -114,7 +145,10 @@ journalctl -u codearts-proxy-aksk -f | grep -E "upstream-error|session-limit|que
 Two knobs decide what the client sees while the account is busy:
 
 - `PROXY_MAX_WAIT_SECONDS=0` — queue instead of returning 429 after 120 s;
-- `PROXY_SESSION_RETRIES=2` plus a client timeout of 300 s or more — absorb a
+- `PROXY_MAX_PER_SESSION=1` — keep companion requests from multiplying the
+  conversation's upstream sessions;
+- `aux_accounts` — move title/summary traffic to a second AK/SK;
+- `PROXY_SESSION_RETRIES=1` plus a client timeout of 300 s or more — absorb a
   1041 caused by another client instead of surfacing it.
 
 The client timeout must be larger than `PROXY_MAX_WAIT_SECONDS`; otherwise the

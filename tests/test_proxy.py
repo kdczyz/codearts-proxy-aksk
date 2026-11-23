@@ -30,6 +30,10 @@ class MockState:
         self.fail_next = 0
         self.delay = 0.0
         self.ports = []
+        self.session_ids = []
+        self.slow_after_first = False
+        self.slow_delay = 0.0
+        self.aborted = False
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -45,6 +49,7 @@ class MockHandler(BaseHTTPRequestHandler):
         with self.state.lock:
             self.state.hits.append(time.monotonic())
             self.state.ports.append(self.client_address[1])
+            self.state.session_ids.append(self.headers.get('Session-Id'))
             fail = self.state.fail_next > 0
             if fail:
                 self.state.fail_next -= 1
@@ -60,13 +65,37 @@ class MockHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        chunk = {
+        first = ('data: ' + json.dumps({
             'id': 'chatcmpl-test',
             'object': 'chat.completion.chunk',
             'model': 'test-model',
             'choices': [{'index': 0, 'delta': {'content': 'ok'}, 'finish_reason': None}],
-        }
-        data = ('data: ' + json.dumps(chunk) + '\n\ndata: [DONE]\n\n').encode()
+        }) + '\n\n').encode()
+        rest = ('data: ' + json.dumps({
+            'id': 'chatcmpl-test',
+            'object': 'chat.completion.chunk',
+            'model': 'test-model',
+            'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}],
+        }) + '\n\ndata: [DONE]\n\n').encode()
+        if self.state.slow_after_first:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Content-Length', str(len(first) + len(rest)))
+            self.end_headers()
+            try:
+                self.wfile.write(first)
+                self.wfile.flush()
+                time.sleep(self.state.slow_delay)
+                self.wfile.write(rest)
+                self.wfile.flush()
+                # A close can surface on the second write; probe once more.
+                self.wfile.write(b': ping\n\n')
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                with self.state.lock:
+                    self.state.aborted = True
+            return
+        data = first + rest
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Content-Length', str(len(data)))
@@ -81,13 +110,15 @@ def free_port():
 
 
 class ProxyFixture:
-    def __init__(self, accounts, window, limit, max_wait, retries=0, retry_delays='0.2'):
+    def __init__(self, accounts, window, limit, max_wait, retries=0,
+                 retry_delays='0.2', max_per_session=0):
         self.accounts = accounts
         self.window = window
         self.limit = limit
         self.max_wait = max_wait
         self.retries = retries
         self.retry_delays = retry_delays
+        self.max_per_session = max_per_session
         self.tmp = tempfile.mkdtemp(prefix='proxy-test-')
 
     def start(self):
@@ -116,6 +147,7 @@ class ProxyFixture:
             'PROXY_WINDOW_SECONDS': str(self.window),
             'PROXY_MAX_PER_WINDOW': str(self.limit),
             'PROXY_MAX_WAIT_SECONDS': str(self.max_wait),
+            'PROXY_MAX_PER_SESSION': str(self.max_per_session),
             'PROXY_SESSION_RETRIES': str(self.retries),
             'PROXY_RETRY_DELAYS': self.retry_delays,
             'PROXY_UPSTREAM_TIMEOUT': '10',
@@ -139,9 +171,11 @@ class ProxyFixture:
     def url(self, path):
         return f'http://127.0.0.1:{self.port}{path}'
 
-    def chat(self, timeout=30):
-        body = json.dumps({'model': 'test-model',
-                           'messages': [{'role': 'user', 'content': 'hi'}]}).encode()
+    def chat(self, timeout=30, content='hi', **extra):
+        payload = {'model': 'test-model',
+                   'messages': [{'role': 'user', 'content': content}]}
+        payload.update(extra)
+        body = json.dumps(payload).encode()
         req = urllib.request.Request(self.url('/v1/chat/completions'), data=body,
                                      headers={'Authorization': 'Bearer test-key',
                                               'Content-Type': 'application/json'})
@@ -249,6 +283,54 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(len(hits), 2)
         self.assertGreaterEqual(hits[1] - hits[0], 0.9,
                                 'the lease must be held until the response ends')
+
+    def test_same_session_requests_are_serialized(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=10, max_per_session=1)
+        proxy.state.delay = 0.5
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: proxy.chat(), range(2)))
+        self.assertEqual([s for s, _ in results], [200, 200])
+        hits = sorted(proxy.state.hits)
+        self.assertGreaterEqual(hits[1] - hits[0], 0.4,
+                                'same conversation must not run two upstream requests at once')
+
+    def test_different_sessions_run_in_parallel(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=10, max_per_session=1)
+        proxy.state.delay = 0.5
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(proxy.chat, content='one'),
+                       pool.submit(proxy.chat, content='two')]
+            results = [f.result() for f in futures]
+        self.assertEqual([s for s, _ in results], [200, 200])
+        hits = sorted(proxy.state.hits)
+        self.assertLess(hits[1] - hits[0], 0.3,
+                        'different conversations should still run in parallel')
+
+    def test_aux_requests_use_aux_accounts(self):
+        accounts = {
+            'accounts': [{'access_key_id': 'ak1', 'secret_access_key': 'sk1'}],
+            'aux_accounts': [{'access_key_id': 'ak2', 'secret_access_key': 'sk2'}],
+        }
+        proxy = self.make(accounts, window=5.0, limit=3, max_wait=5)
+        proxy.chat(content='hello')
+        proxy.chat(content='make a short title', max_tokens=48)
+        ids = proxy.state.session_ids
+        self.assertEqual(len(ids), 2)
+        self.assertNotEqual(ids[0], ids[1],
+                            'auxiliary request should go through aux_accounts')
+
+    def test_disconnect_aborts_upstream(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=5)
+        proxy.state.slow_after_first = True
+        proxy.state.slow_delay = 0.6
+        with self.assertRaises((socket.timeout, TimeoutError, urllib.error.URLError)):
+            proxy.chat(timeout=0.3)
+        time.sleep(1.2)
+        self.assertTrue(proxy.state.aborted,
+                        'client disconnect must close the upstream request')
 
     def test_upstream_connection_is_reused(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
