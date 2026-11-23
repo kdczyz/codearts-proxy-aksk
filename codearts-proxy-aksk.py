@@ -113,7 +113,6 @@ def sign(ak, sk, method, url, body_bytes):
     sig = hmac.new(sk.encode(), string_to_sign.encode(), hashlib.sha256).hexdigest()
     out = dict(headers)
     out['Authorization'] = f'SDK-HMAC-SHA256 Access={ak}, SignedHeaders={signed}, Signature={sig}'
-    out['X-Sdk-Date'] = sdk_date
     return out
 
 
