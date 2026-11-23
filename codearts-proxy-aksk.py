@@ -98,6 +98,14 @@ MAX_WAIT = float(cfg('PROXY_MAX_WAIT_SECONDS', '120'))
 # Retries on TM.00001041. A retry costs another lease and another window slot,
 # so the default is no retry: surface 429 and let the client back off.
 RETRIES = max(0, int(cfg('PROXY_SESSION_RETRIES', '0')))
+# Non-streaming upstream calls are NOT counted against the 3-session limit
+# (measured 2026-11-23: a non-stream call succeeds while 3 streaming sessions
+# linger, and 6 concurrent non-stream calls all return 200). When a streaming
+# request finds no lease free, send it non-stream instead of queueing for the
+# 60 s linger, then re-emit the completed reply as SSE. First token then
+# arrives after generation (~5-15 s) instead of after the queue (~45-60 s).
+NONSTREAM_FALLBACK = cfg('PROXY_NONSTREAM_FALLBACK', '1').strip().lower() not in (
+    '0', 'false', 'no')
 # Auxiliary requests (title/summary/suggestions) are routed to aux_accounts
 # when configured, so they never compete with the main conversation.
 AUX_MAX_TOKENS = max(0, int(cfg('PROXY_AUX_MAX_TOKENS', '256')))
@@ -178,6 +186,13 @@ class Account:
             while self.linger and now - self.linger[0] >= WINDOW:
                 self.linger.popleft()
             return self.active + len(self.linger)
+
+    def has_free(self, now):
+        """Peek: True when a lease is available right now, without taking one."""
+        with self.lock:
+            while self.linger and now - self.linger[0] >= WINDOW:
+                self.linger.popleft()
+            return self.active + len(self.linger) < MAX_PER_WINDOW
 
 
 def load_accounts(path):
@@ -460,6 +475,10 @@ class PooledResponse:
                     pass
 
 
+class _FallbackToQueue(Exception):
+    """Non-stream fallback hit the session limit; use the queued path."""
+
+
 def _post_upstream(account, body):
     headers = sign(account.ak, account.sk, 'POST', SNAP_URL, body)
     # Session headers are added after signing (not part of the canonical
@@ -655,6 +674,7 @@ class Handler(BaseHTTPRequestHandler):
                 'aux_accounts': len(AUX_ACCOUNTS),
                 'aux_max_chars': AUX_MAX_CHARS,
                 'used': [a.used(now) for a in ACCOUNTS],
+                'nonstream_fallback': NONSTREAM_FALLBACK,
                 'max_wait_seconds': MAX_WAIT,
                 'max_active': MAX_ACTIVE,
             })
@@ -702,12 +722,22 @@ class Handler(BaseHTTPRequestHandler):
         req.setdefault('model', MODEL)
         upstream_body = json.dumps(req).encode()
         cancel = getattr(self, '_cancel_event', None)
+        key, key_source = _session_key(req, self.headers, self.client_address[0])
+        aux = _is_aux_request(req)
+        accounts = AUX_ACCOUNTS if (aux and AUX_ACCOUNTS) else PRIMARY_ACCOUNTS
+        if req.get('stream') and NONSTREAM_FALLBACK and accounts:
+            now = time.monotonic()
+            if not any(a.has_free(now) for a in accounts):
+                try:
+                    self._handle_nonstream_converted(req, accounts, cancel)
+                    return
+                except _FallbackToQueue:
+                    pass
+                except ClientGone:
+                    return
         session = None
         try:
             try:
-                key, key_source = _session_key(req, self.headers, self.client_address[0])
-                aux = _is_aux_request(req)
-                accounts = AUX_ACCOUNTS if (aux and AUX_ACCOUNTS) else PRIMARY_ACCOUNTS
                 session, session_wait = acquire_session(key, cancel)
                 if session_wait >= 0.1 or aux:
                     print(f'[session] key={key[:12] if key else "-"} source={key_source} '
@@ -755,6 +785,94 @@ class Handler(BaseHTTPRequestHandler):
                 account.release(time.monotonic())
         finally:
             release_session(session)
+
+    def _handle_nonstream_converted(self, req, accounts, cancel):
+        """Send a streaming request as non-stream upstream, then re-emit SSE.
+
+        Non-stream calls are not counted against the upstream 3-session
+        limit, so a request that would otherwise queue behind the 60 s
+        linger runs immediately. On TM.00001041 raise _FallbackToQueue so
+        the caller retries through the normal queued streaming path.
+        """
+        upstream_req = dict(req)
+        upstream_req['stream'] = False
+        body = json.dumps(upstream_req).encode()
+        account = min(accounts, key=lambda a: a.used(time.monotonic()))
+        try:
+            uresp = _post_upstream(account, body)
+        except urllib.error.HTTPError as e:
+            err_body = e.read()
+            _log_upstream_error(e.code, err_body)
+            if b'TM.00001041' in err_body:
+                raise _FallbackToQueue()
+            self._send_json(e.code, {'error': {'message': 'upstream error',
+                                               'type': 'server_error'}})
+            return
+        except Exception as e:
+            self._send_json(502, {'error': f'upstream error: {e}'})
+            return
+        try:
+            raw = uresp.read()
+        finally:
+            try:
+                uresp.close()
+            except Exception:
+                pass
+        try:
+            data = json.loads(raw.decode('utf-8', 'replace'))
+        except Exception:
+            raise _FallbackToQueue()
+        if not isinstance(data, dict) or not data.get('choices'):
+            raise _FallbackToQueue()
+        print('[fallback] non-stream upstream, no lease waited',
+              file=sys.stderr, flush=True)
+        self._send_sse_from_json(data, cancel)
+
+    def _send_sse_from_json(self, data, cancel=None):
+        """Re-emit a completed non-stream reply as SSE chunks."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'close')
+        self.close_connection = True
+        self.end_headers()
+        cid = data.get('id') or ('as-' + uuid.uuid4().hex[:12])
+        model = data.get('model') or MODEL
+        created = data.get('created') or int(time.time())
+
+        def chunk(delta, finish=None, usage=None):
+            obj = {'id': cid, 'object': 'chat.completion.chunk',
+                   'created': created, 'model': model,
+                   'choices': [{'index': 0, 'delta': delta,
+                                'finish_reason': finish}]}
+            if usage is not None:
+                obj['usage'] = usage
+            return ('data: ' + json.dumps(obj) + '\n\n').encode()
+
+        try:
+            ch = (data.get('choices') or [{}])[0] or {}
+            msg = ch.get('message') or {}
+            finish = ch.get('finish_reason') or 'stop'
+            usage = data.get('usage')
+            self.wfile.write(chunk({'role': 'assistant'}))
+            self.wfile.flush()
+            for field in ('reasoning_content', 'content'):
+                text = msg.get(field)
+                if text:
+                    for i in range(0, len(text), 1000):
+                        self.wfile.write(chunk({field: text[i:i + 1000]}))
+                        self.wfile.flush()
+            if msg.get('tool_calls'):
+                self.wfile.write(chunk({'tool_calls': msg['tool_calls']}))
+                self.wfile.flush()
+            self.wfile.write(chunk({}, finish=finish, usage=usage))
+            self.wfile.flush()
+            self.wfile.write(b'data: [DONE]\n\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            if cancel is not None:
+                cancel.set()
+            return
 
     def _relay_stream(self, uresp, cancel):
         self.send_response(200)

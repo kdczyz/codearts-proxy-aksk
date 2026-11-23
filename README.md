@@ -54,6 +54,13 @@ What the proxy does:
 - auxiliary requests (small `max_tokens`, or prompts mentioning title/summary/
   suggestion) are routed to `aux_accounts` when configured, so they never
   compete with the main conversation;
+- non-streaming upstream calls do not count against the 3-session limit
+  (measured: 6 concurrent non-stream calls all return 200, and a non-stream
+  call succeeds while 3 streaming sessions linger). So when a streaming
+  request finds no lease free, the proxy sends it non-stream instead of
+  queueing for the 60 s linger, then re-emits the reply as SSE
+  (`PROXY_NONSTREAM_FALLBACK=1`, default on; `[fallback]` in the log). First
+  token then arrives after generation instead of after the queue;
 - queued requests are cancelled as soon as the client disconnects, and an
   in-flight upstream response is closed too, so the upstream stops generating
   and releases its session within ~200 ms;

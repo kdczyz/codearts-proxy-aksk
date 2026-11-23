@@ -31,6 +31,7 @@ class MockState:
         self.delay = 0.0
         self.ports = []
         self.session_ids = []
+        self.stream_flags = []
         self.slow_after_first = False
         self.slow_delay = 0.0
         self.aborted = False
@@ -45,11 +46,16 @@ class MockHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get('Content-Length', 0))
-        self.rfile.read(length)
+        raw = self.rfile.read(length)
+        try:
+            stream_flag = json.loads(raw).get('stream')
+        except Exception:
+            stream_flag = None
         with self.state.lock:
             self.state.hits.append(time.monotonic())
             self.state.ports.append(self.client_address[1])
             self.state.session_ids.append(self.headers.get('Session-Id'))
+            self.state.stream_flags.append(stream_flag)
             fail = self.state.fail_next > 0
             if fail:
                 self.state.fail_next -= 1
@@ -60,6 +66,24 @@ class MockHandler(BaseHTTPRequestHandler):
             data = json.dumps({'error_code': 'TM.00001041',
                                'error_msg': 'session limit'}).encode()
             self.send_response(400)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if stream_flag is False:
+            data = json.dumps({
+                'id': 'chatcmpl-test',
+                'object': 'chat.completion',
+                'model': 'test-model',
+                'choices': [{'index': 0,
+                             'message': {'role': 'assistant', 'content': 'ok',
+                                         'reasoning_content': 'think'},
+                             'finish_reason': 'stop'}],
+                'usage': {'prompt_tokens': 1, 'completion_tokens': 1,
+                          'total_tokens': 2},
+            }).encode()
+            self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
@@ -345,6 +369,29 @@ class WindowTests(unittest.TestCase):
         hits = sorted(proxy2.state.hits)
         self.assertLess(hits[1] - hits[0], 0.3,
                         'different last message must not serialize')
+
+    def test_streaming_falls_back_to_nonstream_when_window_full(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=10, max_per_session=1)
+        proxy.state.delay = 0.5
+        # Fill all 3 leases with streaming requests; they linger 5 s after.
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(
+                lambda i: proxy.chat(content=f'fill-{i}', stream=True), range(3)))
+        self.assertEqual([s for s, _ in results], [200, 200, 200])
+        start = time.monotonic()
+        status, body = proxy.chat(content='overflow', stream=True)
+        elapsed = time.monotonic() - start
+        self.assertEqual(status, 200)
+        self.assertIn(b'ok', body)
+        self.assertLess(elapsed, 2.5,
+                        'overflow request must use the non-stream fallback, '
+                        'not wait out the 5 s window')
+        self.assertIn(False, proxy.state.stream_flags,
+                      'fallback must send stream=false upstream')
+        # And a non-stream client request still works through the normal path.
+        status, body = proxy.chat(content='plain')
+        self.assertEqual(status, 200)
 
     def test_header_session_key_serializes_different_messages(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
