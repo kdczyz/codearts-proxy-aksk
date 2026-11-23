@@ -63,9 +63,11 @@ What the proxy does:
   token then arrives after generation instead of after the queue. But a
   non-stream call sends no bytes until generation finishes, and Huawei's
   gateway returns 504 (APIG.0203, backend timeout) at ~60 s, so the fallback
-  gives up after `PROXY_NONSTREAM_TIMEOUT` (default 55 s) and switches to the
+  gives up after `PROXY_NONSTREAM_TIMEOUT` (default 45 s) and switches to the
   queued streaming path, which survives past 60 s (measured 68.6 s) because
-  its chunks keep flowing; an upstream 504 does the same switch. A write to
+  its chunks keep flowing; an upstream 504 does the same switch. The cap is
+  45 s, not 55 s: the gateway timeout varies (~54-61 s) and a 55 s cap raced
+  it and lost once. A write to
   a stale pooled TLS connection fails instantly with SSLWantWriteError ("The
   write operation timed out", seen 3x on 2026-11-23 after long queue waits);
   the proxy retries such a write once on a fresh connection instead of
@@ -123,7 +125,7 @@ primary account to itself:
 | `PROXY_RETRY_DELAYS` | `5,15` | backoff before each retry |
 | `PROXY_MAX_ACTIVE` | `64` | max concurrent client requests |
 | `PROXY_UPSTREAM_TIMEOUT` | `300` | upstream read timeout in seconds |
-| `PROXY_NONSTREAM_TIMEOUT` | `55` | seconds a converted non-stream call may run before switching to streaming (Huawei gateway 504s at ~60 s) |
+| `PROXY_NONSTREAM_TIMEOUT` | `45` | seconds a converted non-stream call may run before switching to streaming (Huawei gateway 504s after ~54-61 s) |
 
 These can go in `codearts-proxy-aksk.env` or in the systemd unit.
 

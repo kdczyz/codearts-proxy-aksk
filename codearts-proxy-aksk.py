@@ -108,10 +108,11 @@ RETRIES = max(0, int(cfg('PROXY_SESSION_RETRIES', '0')))
 NONSTREAM_FALLBACK = cfg('PROXY_NONSTREAM_FALLBACK', '1').strip().lower() not in (
     '0', 'false', 'no')
 # Seconds a converted non-stream call may run before giving up and switching
-# to the queued streaming path. Huawei's gateway returns 504 (APIG.0203) at
-# ~60 s with no response bytes, so stay below it; streaming survives past
-# 60 s total (measured 68.6 s) because chunks keep flowing.
-NONSTREAM_TIMEOUT = float(cfg('PROXY_NONSTREAM_TIMEOUT', '55'))
+# to the queued streaming path. Huawei's gateway returns 504 (APIG.0203)
+# with no response bytes, after ~54-61 s (varies with load); a 55 s cap
+# raced it and lost on 2026-11-23, so stay well below it. Streaming
+# survives past 60 s total (measured 68.6 s) because chunks keep flowing.
+NONSTREAM_TIMEOUT = float(cfg('PROXY_NONSTREAM_TIMEOUT', '45'))
 # Auxiliary requests (title/summary/suggestions) are routed to aux_accounts
 # when configured, so they never compete with the main conversation.
 AUX_MAX_TOKENS = max(0, int(cfg('PROXY_AUX_MAX_TOKENS', '256')))
