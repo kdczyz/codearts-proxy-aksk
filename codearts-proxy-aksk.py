@@ -1,39 +1,48 @@
 #!/usr/bin/env python3
 """codearts-proxy-aksk: OpenAI-compatible relay for Huawei snap-access.
-Unlike the original codearts-proxy (which reads a rotating IAM token from a
-file), this one signs every upstream request with the permanent AK/SK
-(SDK-HMAC-SHA256). No token, no renewal, no expiry.
 
-Listens on 127.0.0.1:18000. Client auth: Authorization: Bearer <LOCAL_API_KEY>
-from /home/ubuntu/codearts-proxy-aksk.env (generated at deploy time).
-Upstream: https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions
-Model: deepseek-v4.1-flash-1017
+Signs every upstream request with a permanent AK/SK (SDK-HMAC-SHA256), so no
+IAM token and no renewal are needed.
+
+Upstream session model (verified against the live endpoint):
+  * every POST /api/v2/chat/completions counts as ONE session;
+  * a session lingers server-side for roughly 60 s after the request ends;
+  * an AK/SK may have at most 3 such sessions alive at the same time,
+    otherwise the endpoint answers HTTP 400 with TM.00001041.
+
+This means the limit is a request-rate limit, not a connection limit: three
+requests inside 60 s fill the account even if they all finish in a second.
+The proxy therefore tracks a sliding window per AK/SK and queues sends until
+a slot in that window is free. Multiple AK/SK accounts can be configured; each
+one adds its own window, which is the only way to actually increase throughput.
 
 Endpoints: POST /v1/chat/completions, POST /chat/completions,
 GET /v1/models, GET /models, GET /healthz.
-Streams SSE through chunk-by-chunk when the client asks stream:true.
 """
 import collections
 import hashlib
 import hmac
 import json
 import os
+import select
+import socket
+import sys
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
+
 BASE = os.path.dirname(os.path.abspath(__file__))
-AKSK_PATH = os.path.join(BASE, 'codearts-aksk.json')
-ENV_PATH = os.path.join(BASE, 'codearts-proxy-aksk.env')
-SNAP_URL = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions'
-MODEL = 'deepseek-v4.1-flash-1017'
-LISTEN_HOST = os.environ.get('PROXY_HOST', '0.0.0.0')
-LISTEN_PORT = int(os.environ.get('PROXY_PORT', '18000'))
+ENV_PATH = os.environ.get('PROXY_ENV_FILE', os.path.join(BASE, 'codearts-proxy-aksk.env'))
 
 
 def load_env(path):
@@ -52,10 +61,39 @@ def load_env(path):
 
 
 ENV = load_env(ENV_PATH)
-LOCAL_API_KEY = ENV.get('LOCAL_API_KEY', '')
-AKSK = json.load(open(AKSK_PATH))
-AK = AKSK['access_key_id']
-SK = AKSK['secret_access_key']
+
+
+def cfg(name, default):
+    """Process env wins, then the .env file, then the built-in default."""
+    return os.environ.get(name) or ENV.get(name) or default
+
+
+AKSK_PATH = cfg('PROXY_AKSK_FILE', os.path.join(BASE, 'codearts-aksk.json'))
+LOCK_PATH = cfg('PROXY_LOCK_FILE', os.path.join(BASE, '.codearts-proxy.lock'))
+SNAP_URL = cfg(
+    'PROXY_UPSTREAM_URL',
+    'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions')
+MODEL = cfg('PROXY_MODEL', 'deepseek-v4.1-flash-1017')
+LISTEN_HOST = cfg('PROXY_HOST', '0.0.0.0')
+LISTEN_PORT = int(cfg('PROXY_PORT', '18000'))
+LOCAL_API_KEY = cfg('LOCAL_API_KEY', '')
+
+# Upstream allows 3 live sessions per AK/SK. Default to 2 so the proxy always
+# leaves one slot for other clients on the same account (IDE, CLI, ...) and
+# never fills the account by itself.
+WINDOW = float(cfg('PROXY_WINDOW_SECONDS', '60'))
+MAX_PER_WINDOW = max(1, int(cfg('PROXY_MAX_PER_WINDOW', '2')))
+# How long a client request may wait for a session lease before 429. 0 = no cap.
+MAX_WAIT = float(cfg('PROXY_MAX_WAIT_SECONDS', '120'))
+# Retries on TM.00001041. Each retry consumes another session lease, so keep
+# this small; 1 means "one extra attempt after the first failure".
+RETRIES = max(0, int(cfg('PROXY_SESSION_RETRIES', '1')))
+RETRY_DELAYS = [
+    float(x) for x in cfg('PROXY_RETRY_DELAYS', '5,15').split(',') if x.strip()
+]
+# Hard ceiling on concurrent client threads so a burst cannot exhaust memory.
+MAX_ACTIVE = max(1, int(cfg('PROXY_MAX_ACTIVE', '64')))
+UPSTREAM_TIMEOUT = float(cfg('PROXY_UPSTREAM_TIMEOUT', '300'))
 
 
 def sign(ak, sk, method, url, body_bytes):
@@ -78,161 +116,170 @@ def sign(ak, sk, method, url, body_bytes):
     return out
 
 
-# Upstream allows at most 3 concurrent sessions per AK/SK (TM.00001041).
-# A session is identified by its Session-Id, and sessions linger after a
-# request finishes, so rapid calls from any client sharing the account
-# stack up and hit the cap even when each client only has one conversation
-# open. Mitigations, all in this proxy:
-#   1. Cap concurrent upstream calls at 2 (a semaphore): at most two
-#      sessions in parallel, leaving 1 of the account's 3-session cap
-#      (TM.00001041) free for other clients sharing the account
-#      (CodeArts IDE, etc.). Each slot keeps a STABLE Session-Id that
-#      is reused
-#      across sequential calls AND across TM.00001041 retries. The
-#      server counts a session as active for ~60s after its last
-#      request, so minting a fresh id on every retry stacks up toward
-#      the cap; reusing the same id keeps the distinct-session count
-#      at 3. A fresh id is minted only after 3 same-id retries fail.
-#   2. On TM.00001041, retry with a FRESH Session-Id and growing delay:
-#      a fresh id can land in a slot freed since the last attempt, while
-#      reusing a stuck id keeps failing. Up to 10 attempts (~60s total).
-#   3. Global throttle: at most 3 upstream sends per 60s (sliding window,
-#      _throttle_wait). Upstream counts each request as a session, so this
-#      is the only thing that actually stops 1041; stable ids alone do not.
-_SESSION_SLOTS = [{'id': uuid.uuid4().hex, 'busy': False} for _ in range(3)]
-_SESSION_SEM = threading.Semaphore(3)
-_SESSION_LOCK = threading.Lock()
-SESSION_RETRIES = 5
-SESSION_RETRY_DELAYS = [5, 10, 15, 20, 30]
+class Account:
+    """One AK/SK plus the session budget that tracks its upstream sessions.
 
-# Global throttle (mitigation 3): at most 3 upstream requests per 60s,
-# sliding window. Upstream counts EVERY request as a session lingering
-# ~60s, so >3 sends in 60s trips TM.00001041 even with stable Session-Ids.
-# This queues (waits) instead of erroring, so 1041 stops; bursts still
-# wait for the oldest session to expire. Per-token output speed is
-# unchanged once generation starts; only the start is delayed when the
-# window is full.
-_THROTTLE_WINDOW = 60.0
-_THROTTLE_MAX = 3
-_THROTTLE_TIMES = collections.deque()
-_THROTTLE_LOCK = threading.Lock()
-
-
-def _throttle_wait():
-    """Block until one more upstream send stays within 3 per 60s."""
-    import sys as _sys
-    while True:
-        with _THROTTLE_LOCK:
-            now = time.monotonic()
-            while _THROTTLE_TIMES and now - _THROTTLE_TIMES[0] >= _THROTTLE_WINDOW:
-                _THROTTLE_TIMES.popleft()
-            if len(_THROTTLE_TIMES) < _THROTTLE_MAX:
-                _THROTTLE_TIMES.append(now)
-                return
-            wait = _THROTTLE_WINDOW - (now - _THROTTLE_TIMES[0])
-        print(f'[throttle] window full (3/60s), waiting {wait:.1f}s', file=_sys.stderr, flush=True)
-        time.sleep(max(wait, 0.05))
-
-
-def _acquire_slot():
-    """Take a free slot (up to 30s). Raises TimeoutError if all slots busy."""
-    if not _SESSION_SEM.acquire(timeout=30):
-        raise TimeoutError('no free session slot within 30s')
-    with _SESSION_LOCK:
-        for slot in _SESSION_SLOTS:
-            if not slot['busy']:
-                slot['busy'] = True
-                return slot
-    # Semaphore guarantees a slot is free; unreachable.
-    _SESSION_SEM.release()
-    raise RuntimeError('no free session slot')
-
-
-def _release_slot(slot):
-    with _SESSION_LOCK:
-        slot['busy'] = False
-    _SESSION_SEM.release()
-
-
-def call_upstream(upstream_body, timeout=60):
-    """POST to snap-access with AK/SK signing + session headers.
-
-    At most 3 upstream calls run concurrently (one per slot); a further
-    call waits for a free slot instead of opening a 4th session. Retries
-    on TM.00001041 (session limit) reusing the same Session-Id first
-    (3 attempts) and only then a fresh one, with growing delay.
-    Returns (status, headers_dict, response). Raises on transport
-    failure. Raises urllib.error.HTTPError for non-2xx that is not the
-    session limit after retries are exhausted (caller reads the error
-    body from it).
+    Upstream starts counting a session when the request is sent and keeps it
+    for WINDOW seconds after the response finishes. A lease therefore stays
+    held for the whole response and only then starts its linger timer.
     """
-    import sys
-    last_err_body = None
-    last_err_code = None
-    # Throttle FIRST (no slot held while waiting): a request that waits
-    # ~60s for the window must not occupy one of the 3 session slots, or
-    # it starves every other request into a 30s slot timeout (503).
-    _throttle_wait()
-    slot = _acquire_slot()
-    try:
-        for attempt in range(SESSION_RETRIES):
-            # ALWAYS reuse the slot's stable id, even on TM.00001041
-            # retries. The server lingers sessions ~60s, so a fresh id
-            # counts as an extra distinct session and makes the limit
-            # worse. Retrying the same id lets the lingering sessions
-            # expire without adding to the count.
-            session_id = slot['id']
-            headers = sign(AK, SK, 'POST', SNAP_URL, upstream_body)
-            # Session headers are added AFTER signing (they do not take part
-            # in the SDK-HMAC-SHA256 canonical request), matching the
-            # reference client.
-            # Chat-Id is FIXED per slot (same as Session-Id), NOT a fresh
-            # uuid per request: the server counts a fresh Chat-Id as a
-            # new session, so rapid calls stacked up past the 3-session
-            # cap (TM.00001041) even with a single stable Session-Id.
-            # Reusing one id per slot keeps the distinct-session count
-            # at most 3 no matter how fast calls arrive.
-            headers['Chat-Id'] = session_id
-            headers['Session-Id'] = session_id
-            headers['lang'] = 'en'
-            ureq = urllib.request.Request(SNAP_URL, data=upstream_body, headers=headers, method='POST')
-            try:
-                uresp = urllib.request.urlopen(ureq, timeout=timeout)
-                return uresp.status, dict(uresp.headers), uresp
-            except urllib.error.HTTPError as e:
-                err_body = e.read()
-                last_err_body = err_body
-                last_err_code = e.code
-                try:
-                    err_text = err_body.decode('utf-8', 'replace')[:600]
-                except Exception:
-                    err_text = '<undecodable>'
-                try:
-                    _r = json.loads(upstream_body)
-                    _model = _r.get('model', '?')
-                    _nmsg = len(_r.get('messages', []) or [])
-                    _tools = 'tools' if _r.get('tools') else 'notools'
-                    _keys = ','.join(sorted(_r.keys()))
-                except Exception:
-                    _model, _nmsg, _tools, _keys = '?', -1, '?', '?'
-                print(f"[upstream-error] status={e.code} model={_model} nmsg={_nmsg} {_tools} keys={_keys} body={err_text}", flush=True)
-                if b'TM.00001041' in err_body and attempt < SESSION_RETRIES - 1:
-                    delay = SESSION_RETRY_DELAYS[attempt]
-                    print(f'session limit hit (attempt {attempt + 1}), '
-                          f'retrying same session in {delay}s',
-                          file=sys.stderr, flush=True)
-                    time.sleep(delay)
-                    continue
-                # Re-raise with the body preserved: build a fresh HTTPError
-                # carrying the bytes we already read, so the caller can
-                # forward it.
-                raise urllib.error.HTTPError(e.url, e.code, e.msg, e.headers,
-                                             _BodyReader(err_body))
-    finally:
-        _release_slot(slot)
-    # Retries exhausted on the session limit: raise the last captured error.
-    raise urllib.error.HTTPError(SNAP_URL, last_err_code or 400, 'session limit', {},
-                                 _BodyReader(last_err_body or b''))
+
+    def __init__(self, ak, sk):
+        self.ak = ak
+        self.sk = sk
+        self.session_id = uuid.uuid4().hex
+        self.active = 0
+        self.linger = collections.deque()
+        self.lock = threading.Lock()
+
+    def try_reserve(self, now):
+        """Take a lease. Returns 0 on success, else seconds until retry."""
+        with self.lock:
+            while self.linger and now - self.linger[0] >= WINDOW:
+                self.linger.popleft()
+            if self.active + len(self.linger) < MAX_PER_WINDOW:
+                self.active += 1
+                return 0.0
+            if self.linger:
+                return max(0.05, self.linger[0] + WINDOW - now)
+            # Only in-flight requests occupy the budget; poll briefly so a
+            # short response frees the slot without a long stall.
+            return 0.5
+
+    def release(self, now):
+        with self.lock:
+            if self.active > 0:
+                self.active -= 1
+            self.linger.append(now)
+
+    def used(self, now):
+        with self.lock:
+            while self.linger and now - self.linger[0] >= WINDOW:
+                self.linger.popleft()
+            return self.active + len(self.linger)
+
+
+def load_accounts(path):
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and 'accounts' in data:
+        items = data['accounts']
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = [data]
+    accounts = []
+    for item in items:
+        ak = item.get('access_key_id') or item.get('ak')
+        sk = item.get('secret_access_key') or item.get('sk')
+        if ak and sk:
+            accounts.append(Account(ak, sk))
+    if not accounts:
+        raise SystemExit(f'no valid access_key_id/secret_access_key in {path}')
+    return accounts
+
+
+ACCOUNTS = load_accounts(AKSK_PATH)
+ACTIVE = threading.BoundedSemaphore(MAX_ACTIVE)
+
+
+class ClientGone(Exception):
+    """The HTTP client disappeared while we were queued or retrying."""
+
+
+class QueueTimeout(Exception):
+    def __init__(self, wait):
+        super().__init__(f'no upstream session slot within {MAX_WAIT}s')
+        self.wait = wait
+
+
+def _sleep_cancellable(seconds, cancel):
+    end = time.monotonic() + seconds
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise ClientGone()
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(left, 0.2))
+
+
+def reserve_send(cancel=None):
+    """Block until one account has a free session lease, then take it."""
+    start = time.monotonic()
+    last_log = start
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise ClientGone()
+        now = time.monotonic()
+        waits = []
+        for account in ACCOUNTS:
+            wait = account.try_reserve(now)
+            if wait <= 0:
+                return account
+            waits.append(wait)
+        wait = min(waits)
+        if MAX_WAIT > 0 and now - start >= MAX_WAIT:
+            raise QueueTimeout(max(wait, 1.0))
+        if now - last_log >= 5:
+            print(f'[queue] all session leases busy, waiting {wait:.1f}s',
+                  file=sys.stderr, flush=True)
+            last_log = now
+        _sleep_cancellable(wait, cancel)
+
+
+def _post_upstream(account, body):
+    headers = sign(account.ak, account.sk, 'POST', SNAP_URL, body)
+    # Session headers are added after signing (not part of the canonical
+    # request). Chat-Id and Session-Id stay stable per account: a fresh id per
+    # request used to be counted as an extra session.
+    headers['Chat-Id'] = account.session_id
+    headers['Session-Id'] = account.session_id
+    headers['lang'] = 'en'
+    req = urllib.request.Request(SNAP_URL, data=body, headers=headers, method='POST')
+    return urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
+
+
+def call_upstream(body, cancel=None):
+    """Send one chat completion, queueing inside the per-account budget.
+
+    Every send, including retries, goes through reserve_send first, so a retry
+    can never silently exceed the budget. On success the caller receives
+    (account, response) and must call account.release() after consuming the
+    response; that is what starts the server-side linger timer.
+    """
+    attempts = 1 + RETRIES
+    last = None
+    for attempt in range(attempts):
+        account = reserve_send(cancel)
+        try:
+            return account, _post_upstream(account, body)
+        except urllib.error.HTTPError as e:
+            err_body = e.read()
+            account.release(time.monotonic())
+            last = (e, err_body)
+            _log_upstream_error(e.code, err_body)
+            if b'TM.00001041' in err_body and attempt + 1 < attempts:
+                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                print(
+                    f'[session-limit] attempt {attempt + 1}/{attempts}, '
+                    f'retrying in {delay:.1f}s (must take a new lease)',
+                    file=sys.stderr, flush=True)
+                _sleep_cancellable(delay, cancel)
+                continue
+            break
+        except Exception:
+            account.release(time.monotonic())
+            raise
+    if last is None:
+        raise RuntimeError('call_upstream ended without a result')
+    e, err_body = last
+    raise urllib.error.HTTPError(e.url, e.code, e.msg, e.headers, _BodyReader(err_body))
+
+
+def _log_upstream_error(code, err_body):
+    text = err_body.decode('utf-8', 'replace')[:600]
+    print(f'[upstream-error] status={code} body={text}', file=sys.stderr, flush=True)
 
 
 class _BodyReader:
@@ -248,27 +295,48 @@ class _BodyReader:
         pass
 
 
+def _watch_client(conn, cancel, stop):
+    """Set cancel when the client closes the connection before we answer."""
+    while not stop.is_set() and not cancel.is_set():
+        try:
+            readable, _, _ = select.select([conn], [], [], 0.5)
+            if not readable:
+                continue
+            try:
+                data = conn.recv(1, socket.MSG_PEEK)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                cancel.set()
+                return
+            if data == b'':
+                cancel.set()
+                return
+        except (OSError, ValueError):
+            cancel.set()
+            return
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
     def log_message(self, fmt, *args):
-        # keep logs quiet: only method + path + status, no bodies, no secrets
-        import sys
         sys.stderr.write('%s %s\n' % (self.command, self.path))
 
-    def _send_json(self, code, obj):
+    def _send_json(self, code, obj, headers=None):
         data = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, str(value))
         self.end_headers()
         self.wfile.write(data)
 
     def _auth_ok(self):
         if not LOCAL_API_KEY:
             return True
-        auth = self.headers.get('Authorization', '')
-        return auth == 'Bearer ' + LOCAL_API_KEY
+        return self.headers.get('Authorization', '') == 'Bearer ' + LOCAL_API_KEY
 
     def do_GET(self):
         if self.path in ('/v1/models', '/models'):
@@ -276,16 +344,23 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 with open(os.path.join(BASE, 'snap_models.json')) as f:
                     for m in json.load(f):
-                        models.append({'id': m['id'], 'object': 'model',
-                                       'owned_by': 'codearts'})
+                        models.append({'id': m['id'], 'object': 'model', 'owned_by': 'codearts'})
             except Exception:
                 models = [{'id': MODEL, 'object': 'model', 'owned_by': 'codearts'}]
             self._send_json(200, {'object': 'list', 'data': models})
         elif self.path in ('/healthz', '/health'):
-            self._send_json(200, {'status': 'ok', 'model': MODEL, 'auth': 'aksk',
-                                  'sessions': len(_SESSION_SLOTS),
-                                  'max_concurrent': len(_SESSION_SLOTS),
-                                  'throttle': f'{_THROTTLE_MAX}/{int(_THROTTLE_WINDOW)}s'})
+            now = time.monotonic()
+            self._send_json(200, {
+                'status': 'ok',
+                'model': MODEL,
+                'auth': 'aksk',
+                'accounts': len(ACCOUNTS),
+                'window_seconds': WINDOW,
+                'max_per_window': MAX_PER_WINDOW,
+                'used': [a.used(now) for a in ACCOUNTS],
+                'max_wait_seconds': MAX_WAIT,
+                'max_active': MAX_ACTIVE,
+            })
         else:
             self._send_json(404, {'error': 'not found'})
 
@@ -296,6 +371,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             self._send_json(401, {'error': {'message': 'invalid api key', 'type': 'auth'}})
             return
+        if not ACTIVE.acquire(timeout=30):
+            self._send_json(503, {'error': {'message': 'proxy too busy, retry later',
+                                            'type': 'server_error'}})
+            return
+        cancel = threading.Event()
+        self._cancel_event = cancel
+        stop = threading.Event()
+        watcher = threading.Thread(target=_watch_client,
+                                   args=(self.connection, cancel, stop), daemon=True)
+        watcher.start()
+        try:
+            self._handle_completion()
+        finally:
+            stop.set()
+            ACTIVE.release()
+
+    def _handle_completion(self):
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length)
         try:
@@ -303,18 +395,27 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json(400, {'error': 'invalid json'})
             return
-        # pass through the client's model; default to deepseek-v4.1-flash-1017
-        # when none is given. Upstream supports several models (see
-        # /home/ubuntu/snap_models.json); the proxy does not restrict them.
         req.setdefault('model', MODEL)
         upstream_body = json.dumps(req).encode()
+        cancel = getattr(self, '_cancel_event', None)
         try:
-            status, resp_headers, uresp = call_upstream(upstream_body)
-        except TimeoutError:
-            self._send_json(503, {'error': 'all upstream sessions busy, retry later'})
+            account, uresp = call_upstream(upstream_body, cancel)
+        except ClientGone:
+            return
+        except QueueTimeout as e:
+            self._send_json(429, {
+                'error': {'message': f'upstream session window full, retry after '
+                                     f'{max(1, int(e.wait))}s', 'type': 'rate_limit'},
+            }, headers={'Retry-After': max(1, int(e.wait))})
             return
         except urllib.error.HTTPError as e:
             err_body = e.read()
+            if b'TM.00001041' in err_body:
+                self._send_json(429, {
+                    'error': {'message': 'upstream session limit (TM.00001041), retry later',
+                              'type': 'rate_limit', 'upstream': err_body.decode('utf-8', 'replace')},
+                }, headers={'Retry-After': max(1, int(WINDOW))})
+                return
             try:
                 self.send_response(e.code)
                 self.send_header('Content-Type', 'application/json')
@@ -327,167 +428,169 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json(502, {'error': f'upstream error: {e}'})
             return
-        is_stream = bool(req.get('stream'))
-        if is_stream:
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/event-stream')
-            self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Connection', 'keep-alive')
-            self.end_headers()
-            saw_finish = False
-            last_id = None
-            last_model = None
-            buf = b''
+
+        try:
+            if req.get('stream'):
+                self._relay_stream(uresp, cancel)
+            else:
+                self._relay_json(uresp)
+        finally:
+            # The upstream session stays alive for WINDOW seconds after the
+            # response ends, so the lease is only released here.
+            account.release(time.monotonic())
+
+    def _relay_stream(self, uresp, cancel):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.end_headers()
+        saw_finish = False
+        last_id = None
+        last_model = None
+        buf = b''
+        try:
+            while True:
+                chunk = uresp.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    line += b'\n'
+                    stripped = line.decode('utf-8', 'replace').strip()
+                    if stripped == 'data: [DONE]':
+                        continue
+                    if stripped.startswith('data:'):
+                        payload = stripped[5:].strip()
+                        if payload:
+                            try:
+                                obj = json.loads(payload)
+                                if obj.get('id'):
+                                    last_id = obj['id']
+                                if obj.get('model'):
+                                    last_model = obj['model']
+                                for ch in obj.get('choices') or []:
+                                    if ch.get('finish_reason'):
+                                        saw_finish = True
+                                line = ('data: ' + json.dumps(obj, ensure_ascii=False) + '\n').encode()
+                            except Exception:
+                                pass
+                    try:
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        if cancel is not None:
+                            cancel.set()
+                        return
+        finally:
             try:
-                while True:
-                    chunk = uresp.read(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    # process complete lines; keep a trailing partial line buffered
-                    while b'\n' in buf:
-                        line, buf = buf.split(b'\n', 1)
-                        line += b'\n'
-                        stripped = line.decode('utf-8', 'replace').strip()
-                        if stripped == 'data: [DONE]':
-                            # hold [DONE]: inject finish_reason first if needed
-                            continue
-                        if stripped.startswith('data:'):
-                            payload = stripped[5:].strip()
-                            if payload:
-                                try:
-                                    obj = json.loads(payload)
-                                    if obj.get('id'):
-                                        last_id = obj['id']
-                                    if obj.get('model'):
-                                        last_model = obj['model']
-                                    for ch in obj.get('choices') or []:
-                                        if ch.get('finish_reason'):
-                                            saw_finish = True
-                                        d = ch.get('delta') or {}
-                                        # keep reasoning_content in the delta:
-                                        # DSH renders it as a separate thinking
-                                        # block; content stays clean.
-                                    # rewrite the line with the patched object
-                                    line = ('data: ' + json.dumps(obj, ensure_ascii=False) + '\n').encode()
-                                except Exception:
-                                    pass
-                        try:
-                            self.wfile.write(line)
-                            self.wfile.flush()
-                        except (BrokenPipeError, ConnectionResetError):
-                            raise
-            except (BrokenPipeError, ConnectionResetError):
+                uresp.close()
+            except Exception:
                 pass
-            finally:
-                try:
-                    uresp.close()
-                except Exception:
-                    pass
-            if not saw_finish:
-                try:
-                    final = {'choices': [{'delta': {}, 'finish_reason': 'stop',
-                                          'index': 0}],
-                             'created': int(time.time()),
-                             'id': last_id or ('as-' + uuid.uuid4().hex[:12]),
-                             'model': last_model or MODEL,
-                             'object': 'chat.completion.chunk'}
-                    self.wfile.write(('data: ' + json.dumps(final) + '\n\n').encode())
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+        if not saw_finish:
             try:
-                self.wfile.write(b'data: [DONE]\n\n')
+                final = {'choices': [{'delta': {}, 'finish_reason': 'stop', 'index': 0}],
+                         'created': int(time.time()),
+                         'id': last_id or ('as-' + uuid.uuid4().hex[:12]),
+                         'model': last_model or MODEL,
+                         'object': 'chat.completion.chunk'}
+                self.wfile.write(('data: ' + json.dumps(final) + '\n\n').encode())
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
-                pass
-            return
-        else:
-            # Upstream returns SSE even for non-streaming requests: one or
-            # more "data: {...}" lines. Collapse them into a single JSON object.
-            try:
-                raw = uresp.read().decode('utf-8', 'replace')
-            finally:
-                try:
-                    uresp.close()
-                except Exception:
-                    pass
-            merged = None
-            content_parts = []
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line.startswith('data:'):
-                    continue
-                payload = line[5:].strip()
-                if payload == '[DONE]':
-                    continue
-                try:
-                    obj = json.loads(payload)
-                except Exception:
-                    continue
-                merged = obj
-                try:
-                    ch = obj['choices'][0]
-                    if 'message' in ch and ch['message'].get('content'):
-                        content_parts = [ch['message']['content']]
-                    elif 'delta' in ch and ch['delta'].get('content'):
-                        content_parts.append(ch['delta']['content'])
-                    elif 'message' in ch and ch['message'].get('reasoning_content'):
-                        content_parts = [ch['message']['reasoning_content']]
-                    elif 'delta' in ch and ch['delta'].get('reasoning_content'):
-                        content_parts.append(ch['delta']['reasoning_content'])
-                except Exception:
-                    pass
-            if merged is None:
-                # not SSE at all; return the raw body as-is
-                data = raw.encode()
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Content-Length', str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
                 return
-            if content_parts:
-                try:
-                    _orig_msg = merged['choices'][0].get('message') or {}
-                    _new_msg = {
-                        'role': 'assistant',
-                        'content': ''.join(content_parts),
-                    }
-                    # keep reasoning_content as its own field so DSH
-                    # shows it as a thinking block; never merge it into
-                    # content. Skip it when content came from the
-                    # reasoning fallback (it IS the content already).
-                    _has_real_content = bool(_orig_msg.get('content'))
-                    if _has_real_content and _orig_msg.get('reasoning_content'):
-                        _new_msg['reasoning_content'] = _orig_msg['reasoning_content']
-                    # keep tool_calls: a model may return both content and
-                    # tool calls; dropping them breaks function calling.
-                    if _orig_msg.get('tool_calls'):
-                        _new_msg['tool_calls'] = _orig_msg['tool_calls']
-                    merged['choices'][0]['message'] = _new_msg
-                    merged['choices'][0].pop('delta', None)
-                    merged['choices'][0]['finish_reason'] = (
-                        merged['choices'][0].get('finish_reason') or 'stop')
-                except Exception:
-                    pass
-            else:
-                # upstream gave no content: still attach a finish_reason
-                try:
-                    if merged.get('choices'):
-                        merged['choices'][0]['finish_reason'] = (
-                            merged['choices'][0].get('finish_reason') or 'stop')
-                except Exception:
-                    pass
-            data = json.dumps(merged).encode()
+        try:
+            self.wfile.write(b'data: [DONE]\n\n')
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _relay_json(self, uresp):
+        try:
+            raw = uresp.read().decode('utf-8', 'replace')
+        finally:
+            try:
+                uresp.close()
+            except Exception:
+                pass
+        merged = None
+        content_parts = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith('data:'):
+                continue
+            payload = line[5:].strip()
+            if payload == '[DONE]':
+                continue
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                continue
+            merged = obj
+            try:
+                ch = obj['choices'][0]
+                if 'message' in ch and ch['message'].get('content'):
+                    content_parts = [ch['message']['content']]
+                elif 'delta' in ch and ch['delta'].get('content'):
+                    content_parts.append(ch['delta']['content'])
+                elif 'message' in ch and ch['message'].get('reasoning_content'):
+                    content_parts = [ch['message']['reasoning_content']]
+                elif 'delta' in ch and ch['delta'].get('reasoning_content'):
+                    content_parts.append(ch['delta']['reasoning_content'])
+            except Exception:
+                pass
+        if merged is None:
+            data = raw.encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+            return
+        if content_parts:
+            try:
+                orig_msg = merged['choices'][0].get('message') or {}
+                new_msg = {'role': 'assistant', 'content': ''.join(content_parts)}
+                if orig_msg.get('content') and orig_msg.get('reasoning_content'):
+                    new_msg['reasoning_content'] = orig_msg['reasoning_content']
+                if orig_msg.get('tool_calls'):
+                    new_msg['tool_calls'] = orig_msg['tool_calls']
+                merged['choices'][0]['message'] = new_msg
+                merged['choices'][0].pop('delta', None)
+                merged['choices'][0]['finish_reason'] = (
+                    merged['choices'][0].get('finish_reason') or 'stop')
+            except Exception:
+                pass
+        else:
+            try:
+                if merged.get('choices'):
+                    merged['choices'][0]['finish_reason'] = (
+                        merged['choices'][0].get('finish_reason') or 'stop')
+            except Exception:
+                pass
+        data = json.dumps(merged).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def _single_instance():
+    if fcntl is None:
+        return None
+    handle = open(LOCK_PATH, 'a+')
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit('another codearts-proxy-aksk instance is already running')
+    return handle
 
 
 if __name__ == '__main__':
+    lock = _single_instance()
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
-    print(f'codearts-proxy-aksk listening on {LISTEN_HOST}:{LISTEN_PORT} model={MODEL}', flush=True)
+    print(f'codearts-proxy-aksk listening on {LISTEN_HOST}:{LISTEN_PORT} '
+          f'model={MODEL} accounts={len(ACCOUNTS)} '
+          f'window={MAX_PER_WINDOW}/{WINDOW:.0f}s', flush=True)
     srv.serve_forever()

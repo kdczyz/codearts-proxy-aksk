@@ -18,23 +18,101 @@ Upstream endpoint: `https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat
 
 ## Upstream session limit
 
-Snap-access allows at most **3 concurrent sessions per AK/SK**. Exceeding it
-returns `TM.00001041` (as HTTP 400). The proxy handles this by:
+Snap-access counts **one session per request**, and a session lingers on the
+server for roughly **60 s** after the response ends. An AK/SK may have at most
+**3 sessions** alive at once, so the real limit is **at most 3 live sessions
+per AK/SK**, where a live session is a request in flight plus the ~60 s the
+server keeps it after the response ends. Three short requests in the same
+second already fill the account; the fourth gets `TM.00001041` (HTTP 400).
 
-- capping concurrent upstream calls at 2 (a semaphore) with one stable
-  session id per slot, leaving 1 slot free for other clients sharing the
-  account (e.g. CodeArts IDE); sequential calls reuse one slot, so a
-  single conversation occupies exactly one slot;
-- retrying on `TM.00001041` by reusing the SAME session id with growing
-  delays (5/10/15/20/30 s). Never minting a fresh id on retry: the server
-  lingers sessions ~60 s, so a fresh id counts as an extra session and
-  makes the limit worse.
+This is why a single chat window can look like it is "eating three sessions":
+one agent turn often sends several requests (tool rounds, title generation,
+retries), and each one counts. The proxy cannot change the server-side limit;
+it can only stay inside it and queue politely.
 
-Sessions linger server-side for roughly 60 s after a burst, so a burst of more
-than 3 parallel calls may still take a while to drain. That is a server-side
-session TTL, not something the proxy can change. For more concurrency, use
-additional Huawei accounts (each has its own 3 slots) and round-robin between
-them.
+What the proxy does:
+
+- the default budget is 2 live sessions per account, not 3: the proxy never
+  fills the account on its own and always leaves one slot for another client
+  sharing the same AK/SK;
+- one session lease per AK/SK: a request takes the lease *before* it is sent
+  and keeps it until the response has been fully relayed. Only then does the
+  lease start its `PROXY_WINDOW_SECONDS` (default 60) linger, matching the
+  server-side TTL. A long streaming response therefore cannot be under-counted,
+  and sequential calls, retries and parallel clients share the same budget;
+- retries on `TM.00001041` go back through the window instead of slipping past
+  it, so a retry can never silently become an extra session;
+- a request that cannot get a slot within `PROXY_MAX_WAIT_SECONDS` (default 120)
+  returns **HTTP 429** with `Retry-After` instead of hanging; set the client
+  timeout above that value if you want the proxy to wait;
+- queued requests are cancelled as soon as the client disconnects, so an
+  abandoned request never consumes a slot;
+- one proxy process per lock file; a second instance exits instead of quietly
+  doubling the request rate against the same AK/SK.
+
+### More throughput: multiple accounts
+
+Each AK/SK adds its own 3/60 s window. `codearts-aksk.json` accepts either one
+account or a list:
+
+```json
+{"accounts": [
+  {"access_key_id": "AK1", "secret_access_key": "SK1"},
+  {"access_key_id": "AK2", "secret_access_key": "SK2"}
+]}
+```
+
+The proxy always sends through the account whose window frees up first. Two
+accounts give 6 requests / 60 s; this is the only way to really raise
+throughput.
+
+### Tuning
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PROXY_WINDOW_SECONDS` | `60` | linger after a response ends, per account |
+| `PROXY_MAX_PER_WINDOW` | `2` | max live sessions per account (in flight + linger); 2 leaves 1 slot free for other clients |
+| `PROXY_MAX_WAIT_SECONDS` | `120` | max queue time before 429 (`0` = wait forever) |
+| `PROXY_SESSION_RETRIES` | `1` | retries on `TM.00001041` (each retry costs a slot) |
+| `PROXY_RETRY_DELAYS` | `5,15` | backoff before each retry |
+| `PROXY_MAX_ACTIVE` | `64` | max concurrent client requests |
+| `PROXY_UPSTREAM_TIMEOUT` | `300` | upstream read timeout in seconds |
+
+These can go in `codearts-proxy-aksk.env` or in the systemd unit.
+
+### If TM.00001041 still appears
+
+With the defaults the proxy cannot exceed the account by itself: one lease per
+in-flight response plus a 60 s linger, a hard cap of 2 live sessions, and a
+lock that refuses a second proxy process. If `TM.00001041` still shows up, the
+same AK/SK is being used somewhere else: CodeArts IDE, the CLI, a leftover
+proxy process, or the daily-claim cron.
+
+```bash
+pgrep -af codearts-proxy-aksk
+journalctl -u codearts-proxy-aksk -f | grep -E "upstream-error|session-limit|queue"
+```
+
+Two knobs decide what the client sees while the account is busy:
+
+- `PROXY_MAX_WAIT_SECONDS=0` — queue instead of returning 429 after 120 s;
+- `PROXY_SESSION_RETRIES=2` plus a client timeout of 300 s or more — absorb a
+  1041 caused by another client instead of surfacing it.
+
+The client timeout must be larger than `PROXY_MAX_WAIT_SECONDS`; otherwise the
+client disconnects first and the request looks "interrupted" while the proxy is
+still queuing normally.
+
+### Tests
+
+`tests/test_proxy.py` starts a mock upstream and checks the invariant that
+matters: never more than `PROXY_MAX_PER_WINDOW` sends per window, retries
+re-enter the window, multiple accounts add up, disconnects drop queued work,
+and a second instance is refused.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## Reasoning / thinking
 
