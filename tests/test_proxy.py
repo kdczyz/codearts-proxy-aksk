@@ -67,7 +67,9 @@ class MockHandler(BaseHTTPRequestHandler):
             if fail:
                 self.state.fail_next -= 1
             delay = self.state.delay
-        if delay:
+        first_token_fast = (stream_flag is True
+                            and self.state.slow_after_first)
+        if delay and not first_token_fast:
             time.sleep(delay)
         if fail:
             data = json.dumps({'error_code': 'TM.00001041',
@@ -154,7 +156,7 @@ def free_port():
 class ProxyFixture:
     def __init__(self, accounts, window, limit, max_wait, retries=0,
                  retry_delays='0.2', max_per_session=0, session_key='auto',
-                 nonstream_timeout=None):
+                 nonstream_timeout=None, upstream_timeout=None):
         self.accounts = accounts
         self.window = window
         self.limit = limit
@@ -164,6 +166,7 @@ class ProxyFixture:
         self.max_per_session = max_per_session
         self.session_key = session_key
         self.nonstream_timeout = nonstream_timeout
+        self.upstream_timeout = upstream_timeout
         self.tmp = tempfile.mkdtemp(prefix='proxy-test-')
 
     def start(self):
@@ -196,7 +199,9 @@ class ProxyFixture:
             'PROXY_SESSION_KEY': self.session_key,
             'PROXY_SESSION_RETRIES': str(self.retries),
             'PROXY_RETRY_DELAYS': self.retry_delays,
-            'PROXY_UPSTREAM_TIMEOUT': '10',
+            'PROXY_UPSTREAM_TIMEOUT': str(self.upstream_timeout
+                                          if self.upstream_timeout is not None
+                                          else 10),
         })
         if self.nonstream_timeout is not None:
             env['PROXY_NONSTREAM_TIMEOUT'] = str(self.nonstream_timeout)
@@ -309,6 +314,27 @@ class WindowTests(unittest.TestCase):
         status, body = proxy.chat()
         self.assertEqual(status, 429)
         self.assertIn(b'TM.00001041', body)
+
+    def test_nonstream_client_uses_streaming_upstream(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=5)
+        status, body = proxy.chat()
+        self.assertEqual(status, 200)
+        self.assertIn(b'ok', body)
+        self.assertEqual(proxy.state.stream_flags, [True],
+                         'a non-stream client request must go upstream as '
+                         'streaming so long generations keep flowing')
+
+    def test_nonstream_long_generation_survives_short_timeout(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=5,
+                          upstream_timeout=1)
+        proxy.state.delay = 2.0
+        proxy.state.slow_after_first = True
+        proxy.state.slow_delay = 0.3
+        status, body = proxy.chat()
+        self.assertEqual(status, 200)
+        self.assertIn(b'ok', body)
 
     def test_streaming_1041_falls_back_to_nonstream(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],

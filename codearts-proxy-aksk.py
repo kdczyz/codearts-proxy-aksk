@@ -814,6 +814,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         req.setdefault('model', MODEL)
         upstream_body = json.dumps(req).encode()
+        if not req.get('stream'):
+            # A non-stream request sits idle for minutes while upstream
+            # generates, then the 300 s socket timeout kills the read
+            # (surfacing as SSLWantWriteError -> 502; seen 2026-11-23 18:16
+            # and 18:23, both exactly 5m0s). Send stream=true upstream so
+            # chunks keep flowing; _relay_json already assembles SSE into a
+            # single JSON response for the client.
+            upstream_req = dict(req)
+            upstream_req['stream'] = True
+            upstream_body = json.dumps(upstream_req).encode()
         cancel = getattr(self, '_cancel_event', None)
         key, key_source = _session_key(req, self.headers, self.client_address[0])
         aux = _is_aux_request(req)
