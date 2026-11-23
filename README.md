@@ -50,7 +50,7 @@ What the proxy does:
   sends the main reply plus title/summary/suggestion requests cannot occupy
   several upstream sessions at once. The conversation key comes from
   `X-Session-Id`/`Chat-Id`/`Session-Id`, then body ids, then a hash of the
-  first two messages;
+  first message, the last message and the message count;
 - auxiliary requests (small `max_tokens`, or prompts mentioning title/summary/
   suggestion) are routed to `aux_accounts` when configured, so they never
   compete with the main conversation;
@@ -122,7 +122,7 @@ The proxy logs one line per request that waited or was routed:
 - `[session] wait=` means the request waited on the per-conversation slot.
 - `[lease] waited` means the account window was full; add accounts.
 - `source=messages` with different keys for the same conversation means the
-  client does not send a session header and its first two messages change.
+  client does not send a session header and its first/last messages change.
   Fix it by sending `Chat-Id`/`X-Session-Id`, by setting
   `PROXY_SESSION_KEY=header`, or — for a single-user proxy — by using
   `PROXY_SESSION_KEY=ip`.

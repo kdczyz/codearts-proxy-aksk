@@ -288,14 +288,21 @@ def _session_key(req, headers, client_ip=None):
     messages = req.get('messages') or []
     if not messages:
         return None, 'none'
+    # Composite key: first message (usually the system prompt) + last
+    # message (the latest turn) + message count. Hashing only the first
+    # two collides when conversations share a system prompt and opening
+    # line, and it shifts when history is truncated; the last message
+    # and the count separate those, while parallel requests sharing one
+    # snapshot still hash alike.
     digest = hashlib.sha256()
-    for message in messages[:2]:
+    for message in (messages[0], messages[-1]):
         digest.update(str(message.get('role', '')).encode('utf-8'))
         content = message.get('content')
         if isinstance(content, str):
             digest.update(content.encode('utf-8'))
         else:
             digest.update(json.dumps(content, sort_keys=True).encode('utf-8'))
+    digest.update(str(len(messages)).encode('utf-8'))
     return 'msgs-' + digest.hexdigest()[:16], 'messages'
 
 

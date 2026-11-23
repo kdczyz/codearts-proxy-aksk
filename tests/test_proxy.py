@@ -313,6 +313,39 @@ class WindowTests(unittest.TestCase):
         self.assertLess(hits[1] - hits[0], 0.3,
                         'different conversations should still run in parallel')
 
+    def test_messages_key_uses_first_last_and_count(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=10, max_per_session=1)
+        proxy.state.delay = 0.5
+        sys_msg = {'role': 'system', 'content': 'sys'}
+        last = {'role': 'user', 'content': 'q-a'}
+        # Same first + last + count, different middle: one conversation.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(proxy.chat, messages=[sys_msg, {'role': 'user', 'content': 'mid-x'}, last]),
+                pool.submit(proxy.chat, messages=[sys_msg, {'role': 'user', 'content': 'mid-y'}, last]),
+            ]
+            results = [f.result() for f in futures]
+        self.assertEqual([s for s, _ in results], [200, 200])
+        hits = sorted(proxy.state.hits)
+        self.assertGreaterEqual(hits[1] - hits[0], 0.4,
+                                'same first/last/count must serialize')
+        # Same first, different last: different conversations, run in parallel.
+        # Fresh proxy: the first part left two leases lingering in its window.
+        proxy2 = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                           window=5.0, limit=3, max_wait=10, max_per_session=1)
+        proxy2.state.delay = 0.5
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(proxy2.chat, messages=[sys_msg, last]),
+                pool.submit(proxy2.chat, messages=[sys_msg, {'role': 'user', 'content': 'q-b'}]),
+            ]
+            results = [f.result() for f in futures]
+        self.assertEqual([s for s, _ in results], [200, 200])
+        hits = sorted(proxy2.state.hits)
+        self.assertLess(hits[1] - hits[0], 0.3,
+                        'different last message must not serialize')
+
     def test_header_session_key_serializes_different_messages(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
                           window=5.0, limit=3, max_wait=10,
