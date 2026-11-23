@@ -848,11 +848,31 @@ class Handler(BaseHTTPRequestHandler):
             except urllib.error.HTTPError as e:
                 err_body = e.read()
                 if b'TM.00001041' in err_body:
-                    self._send_json(429, {
-                        'error': {'message': 'upstream session limit (TM.00001041), retry later',
-                                  'type': 'rate_limit',
-                                  'upstream': err_body.decode('utf-8', 'replace')},
-                    }, headers={'Retry-After': max(1, int(WINDOW))})
+                    # A streaming request that took a lease can still hit the
+                    # cap: upstream also counts the previous process's
+                    # sessions for ~60 s after a restart, while this
+                    # process's budget resets to empty. Non-stream calls are
+                    # not counted, so convert to the fallback instead of
+                    # failing the client with 429 (seen 2026-11-23 18:16,
+                    # first burst after a restart: 2x 1041, 1x client 429).
+                    if req.get('stream') and NONSTREAM_FALLBACK and accounts:
+                        try:
+                            self._handle_nonstream_converted(req, accounts, cancel)
+                            return
+                        except _FallbackToQueue:
+                            pass
+                        except ClientGone:
+                            return
+                        except Exception:
+                            pass
+                    try:
+                        self._send_json(429, {
+                            'error': {'message': 'upstream session limit (TM.00001041), retry later',
+                                      'type': 'rate_limit',
+                                      'upstream': err_body.decode('utf-8', 'replace')},
+                        }, headers={'Retry-After': max(1, int(WINDOW))})
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
                     return
                 try:
                     self.send_response(e.code)

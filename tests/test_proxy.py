@@ -310,6 +310,17 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(status, 429)
         self.assertIn(b'TM.00001041', body)
 
+    def test_streaming_1041_falls_back_to_nonstream(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=5, retries=0)
+        proxy.state.fail_next = 1
+        status, body = proxy.chat(stream=True)
+        self.assertEqual(status, 200)
+        self.assertIn(b'ok', body)
+        self.assertEqual(proxy.state.stream_flags, [True, False],
+                         '1041 on the streaming attempt must convert to a '
+                         'non-stream fallback, not a 429')
+
     def test_disconnect_drops_queued_request(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
                           window=2.0, limit=1, max_wait=10)
