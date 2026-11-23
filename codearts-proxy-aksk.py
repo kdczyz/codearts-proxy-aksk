@@ -132,6 +132,13 @@ RETRY_DELAYS = [
 # Hard ceiling on concurrent client threads so a burst cannot exhaust memory.
 MAX_ACTIVE = max(1, int(cfg('PROXY_MAX_ACTIVE', '64')))
 UPSTREAM_TIMEOUT = float(cfg('PROXY_UPSTREAM_TIMEOUT', '300'))
+# Time to wait for the first byte (response headers) from upstream. A pooled
+# keep-alive connection can go stale half-open: the POST write succeeds into
+# the void and upstream never answers, so the read hangs until the 300 s
+# socket timeout (surfacing as SSLWantWriteError -> 502; seen 2026-11-23
+# 18:16, 18:23 and 18:43, all exactly 5m0s, and DSH's pi-ai client gives up
+# at the same 300 s). 60 s is safe: first tokens arrive in <30 s (p90 10 s).
+FIRST_BYTE_TIMEOUT = float(cfg('PROXY_FIRST_BYTE_TIMEOUT', '60'))
 
 
 def sign(ak, sk, method, url, body_bytes):
@@ -496,33 +503,43 @@ def _post_upstream(account, body, timeout=None):
     headers['Session-Id'] = account.session_id
     headers['lang'] = 'en'
     headers['Connection'] = 'keep-alive'
+    # Bound the wait for the first byte (see FIRST_BYTE_TIMEOUT). Once the
+    # headers arrive the connection is alive, so restore the long timeout
+    # for the streaming read (chunks keep flowing, only a long silence
+    # should time out). The non-stream fallback passes its own timeout and
+    # keeps it; its caller restores the default after a successful read.
+    first_byte = timeout if timeout is not None else FIRST_BYTE_TIMEOUT
     for attempt in range(2):
         conn = POOL.acquire()
-        if timeout is not None:
-            # Per-operation socket timeout for this call only. A pooled
-            # connection keeps it afterwards; 55 s per recv is harmless for
-            # streaming (chunks arrive constantly) and the converted caller
-            # restores the default after a successful read.
-            try:
-                if conn.sock is not None:
-                    conn.sock.settimeout(timeout)
-                else:
-                    conn.timeout = timeout
-            except Exception:
-                pass
+        try:
+            if conn.sock is not None:
+                conn.sock.settimeout(first_byte)
+            else:
+                conn.timeout = first_byte
+        except Exception:
+            pass
         try:
             conn.request('POST', _UPSTREAM_PATH, body=body, headers=headers)
             resp = conn.getresponse()
+            if timeout is None:
+                try:
+                    if conn.sock is not None:
+                        conn.sock.settimeout(UPSTREAM_TIMEOUT)
+                except Exception:
+                    pass
             break
         except (http.client.RemoteDisconnected, ConnectionResetError,
-                BrokenPipeError, ssl.SSLWantWriteError) as e:
+                BrokenPipeError, ssl.SSLWantWriteError, ssl.SSLWantReadError,
+                socket.timeout) as e:
             # An idle keep-alive connection may have been closed by the
             # upstream; retry once on a fresh connection. SSLWantWriteError
             # ("The write operation timed out") is how a write to such a
             # stale TLS connection surfaces; it fired instantly after a long
             # queue wait on 2026-11-23 and returned 502 before this retry.
-            print(f'[upstream] write failed ({type(e).__name__}), retrying '
-                  f'on a fresh connection', file=sys.stderr, flush=True)
+            # A timeout here means no first byte arrived at all, i.e. the
+            # connection went stale half-open (write succeeded, read hung).
+            print(f'[upstream] stale connection ({type(e).__name__}), '
+                  f'retrying on a fresh connection', file=sys.stderr, flush=True)
             try:
                 conn.close()
             except Exception:

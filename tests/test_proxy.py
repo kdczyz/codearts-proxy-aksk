@@ -42,6 +42,7 @@ class MockState:
         self.slow_after_first = False
         self.slow_delay = 0.0
         self.aborted = False
+        self.hang_next = 0
 
 
 class MockHandler(BaseHTTPRequestHandler):
@@ -71,6 +72,13 @@ class MockHandler(BaseHTTPRequestHandler):
                             and self.state.slow_after_first)
         if delay and not first_token_fast:
             time.sleep(delay)
+        with self.state.lock:
+            hang = self.state.hang_next > 0
+            if hang:
+                self.state.hang_next -= 1
+        if hang:
+            time.sleep(15)
+            return
         if fail:
             data = json.dumps({'error_code': 'TM.00001041',
                                'error_msg': 'session limit'}).encode()
@@ -156,7 +164,8 @@ def free_port():
 class ProxyFixture:
     def __init__(self, accounts, window, limit, max_wait, retries=0,
                  retry_delays='0.2', max_per_session=0, session_key='auto',
-                 nonstream_timeout=None, upstream_timeout=None):
+                 nonstream_timeout=None, upstream_timeout=None,
+                 first_byte_timeout=None):
         self.accounts = accounts
         self.window = window
         self.limit = limit
@@ -167,6 +176,7 @@ class ProxyFixture:
         self.session_key = session_key
         self.nonstream_timeout = nonstream_timeout
         self.upstream_timeout = upstream_timeout
+        self.first_byte_timeout = first_byte_timeout
         self.tmp = tempfile.mkdtemp(prefix='proxy-test-')
 
     def start(self):
@@ -205,6 +215,8 @@ class ProxyFixture:
         })
         if self.nonstream_timeout is not None:
             env['PROXY_NONSTREAM_TIMEOUT'] = str(self.nonstream_timeout)
+        if self.first_byte_timeout is not None:
+            env['PROXY_FIRST_BYTE_TIMEOUT'] = str(self.first_byte_timeout)
         self.env = env
         self.proc = subprocess.Popen([sys.executable, SCRIPT], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -324,6 +336,17 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(proxy.state.stream_flags, [True],
                          'a non-stream client request must go upstream as '
                          'streaming so long generations keep flowing')
+
+    def test_stale_connection_first_byte_timeout_retries(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=5,
+                          first_byte_timeout=0.5)
+        proxy.state.hang_next = 1
+        status, body = proxy.chat(stream=True)
+        self.assertEqual(status, 200)
+        self.assertIn(b'ok', body)
+        self.assertEqual(len(proxy.state.hits), 2,
+                         'a hung first byte must retry on a fresh connection')
 
     def test_nonstream_long_generation_survives_short_timeout(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
