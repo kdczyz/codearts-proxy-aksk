@@ -26,6 +26,7 @@ import http.client
 import json
 import os
 import select
+import signal
 import socket
 import ssl
 import sys
@@ -646,8 +647,63 @@ def _watch_client(conn, cancel, stop, on_gone=None):
             return
 
 
+# Graceful shutdown. systemctl restart sends SIGTERM; without this the
+# process dies instantly and any in-flight streaming request fails on the
+# client side ("do request failed: EOF" in new-api, 500 to DSH) - seen
+# 2026-11-23 17:40:48, when a deploy restart killed a DSH request
+# mid-generation. On SIGTERM the server stops accepting, waits for
+# in-flight requests to finish (at most _DRAIN_SECONDS), then exits.
+_IN_FLIGHT = 0
+_IN_FLIGHT_LOCK = threading.Lock()
+_DRAIN_SECONDS = 60.0
+_SHUTDOWN_REQUESTED = threading.Event()
+
+
+def _drain_and_exit(server):
+    try:
+        server.shutdown()
+    except Exception:
+        pass
+    try:
+        server.server_close()
+    except Exception:
+        pass
+    deadline = time.monotonic() + _DRAIN_SECONDS
+    while time.monotonic() < deadline:
+        with _IN_FLIGHT_LOCK:
+            if _IN_FLIGHT == 0:
+                break
+        time.sleep(0.2)
+    with _IN_FLIGHT_LOCK:
+        remaining = _IN_FLIGHT
+    print(f'[shutdown] exiting, {remaining} request(s) still in flight',
+          file=sys.stderr, flush=True)
+    os._exit(0)
+
+
+def _on_signal(signum, frame):
+    print(f'[shutdown] signal {signum}, draining in-flight requests',
+          file=sys.stderr, flush=True)
+    _SHUTDOWN_REQUESTED.set()
+    threading.Thread(target=_drain_and_exit, args=(_SERVER[0],),
+                     daemon=True).start()
+
+
+_SERVER = []
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+
+    def handle_one_request(self):
+        global _IN_FLIGHT
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT += 1
+        try:
+            super().handle_one_request()
+        finally:
+            with _IN_FLIGHT_LOCK:
+                _IN_FLIGHT -= 1
 
     def setup(self):
         super().setup()
@@ -1088,7 +1144,14 @@ def _single_instance():
 if __name__ == '__main__':
     lock = _single_instance()
     srv = ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler)
+    _SERVER.append(srv)
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
     print(f'codearts-proxy-aksk listening on {LISTEN_HOST}:{LISTEN_PORT} '
           f'model={MODEL} accounts={len(ACCOUNTS)} '
           f'window={MAX_PER_WINDOW}/{WINDOW:.0f}s', flush=True)
     srv.serve_forever()
+    if _SHUTDOWN_REQUESTED.is_set():
+        # The drain thread exits the process once in-flight requests finish.
+        while True:
+            time.sleep(3600)

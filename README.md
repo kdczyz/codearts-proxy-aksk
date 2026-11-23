@@ -75,6 +75,11 @@ What the proxy does:
 - queued requests are cancelled as soon as the client disconnects, and an
   in-flight upstream response is closed too, so the upstream stops generating
   and releases its session within ~200 ms;
+- graceful shutdown: on SIGTERM the server stops accepting, waits for
+  in-flight requests to finish (at most 60 s), then exits, so a
+  `systemctl restart` no longer kills a request mid-generation (that used
+  to surface as new-api 500 "do request failed: EOF"); deploy during a
+  quiet moment anyway, so the drain is normally empty;
 - one proxy process per lock file; a second instance exits instead of quietly
   doubling the request rate against the same AK/SK.
 

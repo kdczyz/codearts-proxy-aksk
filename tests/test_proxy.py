@@ -7,6 +7,8 @@ account, including retries.
 """
 import importlib.util
 import json
+import signal
+
 import os
 import socket
 import ssl
@@ -616,6 +618,28 @@ def _load_proxy_module(tmp):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     return mod
+
+
+class GracefulShutdownTests(unittest.TestCase):
+    def make(self, accounts, **kwargs):
+        fixture = ProxyFixture(accounts, **kwargs).start()
+        self.addCleanup(fixture.stop)
+        return fixture
+
+    def test_sigterm_waits_for_in_flight_request(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=60.0, limit=3, max_wait=10,
+                          max_per_session=1)
+        proxy.state.delay = 2.0
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(proxy.chat, content='slow', stream=True)
+            time.sleep(0.5)
+            proxy.proc.send_signal(signal.SIGTERM)
+            status, body = future.result(timeout=15)
+        self.assertEqual(status, 200)
+        self.assertIn(b'ok', body)
+        self.assertEqual(proxy.proc.wait(timeout=10), 0,
+                         'proxy must exit 0 after draining')
 
 
 class UpstreamRetryTests(unittest.TestCase):
