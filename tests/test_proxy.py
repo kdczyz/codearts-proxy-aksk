@@ -29,10 +29,12 @@ class MockState:
         self.hits = []
         self.fail_next = 0
         self.delay = 0.0
+        self.ports = []
 
 
 class MockHandler(BaseHTTPRequestHandler):
     state = None
+    protocol_version = 'HTTP/1.1'
 
     def log_message(self, *args):
         pass
@@ -42,6 +44,7 @@ class MockHandler(BaseHTTPRequestHandler):
         self.rfile.read(length)
         with self.state.lock:
             self.state.hits.append(time.monotonic())
+            self.state.ports.append(self.client_address[1])
             fail = self.state.fail_next > 0
             if fail:
                 self.state.fail_next -= 1
@@ -234,7 +237,7 @@ class WindowTests(unittest.TestCase):
 
     def test_lease_covers_the_whole_response(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
-                          window=10.0, limit=1, max_wait=10)
+                          window=1.0, limit=1, max_wait=10)
         proxy.state.delay = 1.0
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(proxy.chat)
@@ -246,6 +249,16 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(len(hits), 2)
         self.assertGreaterEqual(hits[1] - hits[0], 0.9,
                                 'the lease must be held until the response ends')
+
+    def test_upstream_connection_is_reused(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=5)
+        for _ in range(3):
+            self.assertEqual(proxy.chat()[0], 200)
+        ports = proxy.state.ports
+        self.assertEqual(len(ports), 3)
+        self.assertEqual(len(set(ports)), 1,
+                         f'keep-alive should reuse one upstream connection: {ports}')
 
     def test_second_instance_is_refused(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],

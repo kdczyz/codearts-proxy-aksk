@@ -80,6 +80,24 @@ throughput.
 
 These can go in `codearts-proxy-aksk.env` or in the systemd unit.
 
+### Latency (time to first byte)
+
+The proxy adds very little on its own:
+
+- upstream TLS connections are kept alive in a small pool, so only the first
+  request pays the handshake (typically 100-300 ms on a WAN);
+- `TCP_NODELAY` is set on client sockets, avoiding Nagle delays on small SSE
+  chunks;
+- streaming uses `read1`, so the first token is forwarded as soon as it
+  arrives instead of waiting for a 4 KiB buffer;
+- SSE lines are forwarded verbatim, with no JSON re-encode;
+- the upstream queue polls every 100 ms, so a freed lease is picked up quickly.
+
+If TTFB is still high, check in this order: `[queue]` lines in the log (waiting
+for a session lease, fixed by more accounts), then `time_appconnect` from
+`curl` (TLS), then the model itself (first token). A client that does not send
+`stream: true` always waits for the full response.
+
 ### If TM.00001041 still appears
 
 With the defaults the proxy cannot exceed the account by itself: one lease per

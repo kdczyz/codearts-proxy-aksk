@@ -22,6 +22,7 @@ GET /v1/models, GET /models, GET /healthz.
 import collections
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import select
@@ -144,7 +145,7 @@ class Account:
                 return max(0.05, self.linger[0] + WINDOW - now)
             # Only in-flight requests occupy the budget; poll briefly so a
             # short response frees the slot without a long stall.
-            return 0.5
+            return 0.1
 
     def release(self, now):
         with self.lock:
@@ -219,13 +220,104 @@ def reserve_send(cancel=None):
                 return account
             waits.append(wait)
         wait = min(waits)
-        if MAX_WAIT > 0 and now - start >= MAX_WAIT:
+        # If the projected total wait would exceed the cap, fail fast instead
+        # of sleeping past it and succeeding later.
+        if MAX_WAIT > 0 and (now - start) + wait > MAX_WAIT:
             raise QueueTimeout(max(wait, 1.0))
         if now - last_log >= 5:
             print(f'[queue] all session leases busy, waiting {wait:.1f}s',
                   file=sys.stderr, flush=True)
             last_log = now
         _sleep_cancellable(wait, cancel)
+
+
+_UPSTREAM = urlparse(SNAP_URL)
+_UPSTREAM_PATH = _UPSTREAM.path + (f'?{_UPSTREAM.query}' if _UPSTREAM.query else '')
+
+
+class ConnectionPool:
+    """Keep-alive pool for upstream TLS connections.
+
+    Reusing the connection skips the TLS handshake on every request, which is
+    the largest fixed cost after queueing. Each connection is used by one
+    request at a time; it is returned only after the body has been read fully.
+    """
+
+    def __init__(self, host, port, https, max_idle=8):
+        self.host = host
+        self.port = port
+        self.https = https
+        self.max_idle = max_idle
+        self.idle = collections.deque()
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        with self.lock:
+            while self.idle:
+                conn = self.idle.pop()
+                if conn.sock is not None:
+                    return conn
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        cls = http.client.HTTPSConnection if self.https else http.client.HTTPConnection
+        return cls(self.host, self.port, timeout=UPSTREAM_TIMEOUT)
+
+    def release(self, conn):
+        if conn.sock is None:
+            return
+        with self.lock:
+            if len(self.idle) < self.max_idle:
+                self.idle.append(conn)
+                return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+POOL = ConnectionPool(
+    _UPSTREAM.hostname,
+    _UPSTREAM.port or (443 if _UPSTREAM.scheme == 'https' else 80),
+    _UPSTREAM.scheme == 'https')
+
+
+class PooledResponse:
+    """Forward a response and return its connection to the pool on EOF."""
+
+    def __init__(self, resp, conn):
+        self._resp = resp
+        self._conn = conn
+        self._eof = False
+        self._closed = False
+
+    def read(self, amt=None):
+        data = self._resp.read(amt)
+        if amt is None or data == b'':
+            self._eof = True
+        return data
+
+    def read1(self, amt=None):
+        data = self._resp.read1(amt)
+        if data == b'':
+            self._eof = True
+        return data
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._resp.close()
+        finally:
+            if self._eof and self._conn.sock is not None:
+                POOL.release(self._conn)
+            else:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
 
 
 def _post_upstream(account, body):
@@ -236,8 +328,26 @@ def _post_upstream(account, body):
     headers['Chat-Id'] = account.session_id
     headers['Session-Id'] = account.session_id
     headers['lang'] = 'en'
-    req = urllib.request.Request(SNAP_URL, data=body, headers=headers, method='POST')
-    return urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
+    headers['Connection'] = 'keep-alive'
+    conn = POOL.acquire()
+    try:
+        conn.request('POST', _UPSTREAM_PATH, body=body, headers=headers)
+        resp = conn.getresponse()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+    if resp.status >= 400:
+        err_body = resp.read()
+        try:
+            resp.close()
+        finally:
+            POOL.release(conn)
+        raise urllib.error.HTTPError(SNAP_URL, resp.status, resp.reason,
+                                     resp.headers, _BodyReader(err_body))
+    return PooledResponse(resp, conn)
 
 
 def call_upstream(body, cancel=None):
@@ -319,6 +429,13 @@ def _watch_client(conn, cancel, stop):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
 
     def log_message(self, fmt, *args):
         sys.stderr.write('%s %s\n' % (self.command, self.path))
@@ -443,7 +560,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-cache')
-        self.send_header('Connection', 'keep-alive')
+        # SSE has no Content-Length. Without chunked framing or a close the
+        # client cannot tell where the body ends except by the [DONE] marker;
+        # close after the stream so generic HTTP clients also finish cleanly.
+        self.send_header('Connection', 'close')
+        self.close_connection = True
         self.end_headers()
         saw_finish = False
         last_id = None
@@ -451,7 +572,7 @@ class Handler(BaseHTTPRequestHandler):
         buf = b''
         try:
             while True:
-                chunk = uresp.read(4096)
+                chunk = uresp.read1(4096) if hasattr(uresp, 'read1') else uresp.read(4096)
                 if not chunk:
                     break
                 buf += chunk
@@ -473,7 +594,6 @@ class Handler(BaseHTTPRequestHandler):
                                 for ch in obj.get('choices') or []:
                                     if ch.get('finish_reason'):
                                         saw_finish = True
-                                line = ('data: ' + json.dumps(obj, ensure_ascii=False) + '\n').encode()
                             except Exception:
                                 pass
                     try:
