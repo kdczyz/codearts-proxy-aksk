@@ -83,7 +83,7 @@ LOCAL_API_KEY = cfg('LOCAL_API_KEY', '')
 # leaves one slot for other clients on the same account (IDE, CLI, ...) and
 # never fills the account by itself.
 WINDOW = float(cfg('PROXY_WINDOW_SECONDS', '60'))
-MAX_PER_WINDOW = max(1, int(cfg('PROXY_MAX_PER_WINDOW', '2')))
+MAX_PER_WINDOW = max(1, int(cfg('PROXY_MAX_PER_WINDOW', '3')))
 # How long a client request may wait for a session lease before 429. 0 = no cap.
 MAX_WAIT = float(cfg('PROXY_MAX_WAIT_SECONDS', '120'))
 # Retries on TM.00001041. Each retry consumes another session lease, so keep
