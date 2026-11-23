@@ -111,7 +111,7 @@ def free_port():
 
 class ProxyFixture:
     def __init__(self, accounts, window, limit, max_wait, retries=0,
-                 retry_delays='0.2', max_per_session=0):
+                 retry_delays='0.2', max_per_session=0, session_key='auto'):
         self.accounts = accounts
         self.window = window
         self.limit = limit
@@ -119,6 +119,7 @@ class ProxyFixture:
         self.retries = retries
         self.retry_delays = retry_delays
         self.max_per_session = max_per_session
+        self.session_key = session_key
         self.tmp = tempfile.mkdtemp(prefix='proxy-test-')
 
     def start(self):
@@ -148,6 +149,7 @@ class ProxyFixture:
             'PROXY_MAX_PER_WINDOW': str(self.limit),
             'PROXY_MAX_WAIT_SECONDS': str(self.max_wait),
             'PROXY_MAX_PER_SESSION': str(self.max_per_session),
+            'PROXY_SESSION_KEY': self.session_key,
             'PROXY_SESSION_RETRIES': str(self.retries),
             'PROXY_RETRY_DELAYS': self.retry_delays,
             'PROXY_UPSTREAM_TIMEOUT': '10',
@@ -171,14 +173,17 @@ class ProxyFixture:
     def url(self, path):
         return f'http://127.0.0.1:{self.port}{path}'
 
-    def chat(self, timeout=30, content='hi', **extra):
+    def chat(self, timeout=30, content='hi', headers=None, **extra):
         payload = {'model': 'test-model',
                    'messages': [{'role': 'user', 'content': content}]}
         payload.update(extra)
         body = json.dumps(payload).encode()
+        hdrs = {'Authorization': 'Bearer test-key',
+                'Content-Type': 'application/json'}
+        if headers:
+            hdrs.update(headers)
         req = urllib.request.Request(self.url('/v1/chat/completions'), data=body,
-                                     headers={'Authorization': 'Bearer test-key',
-                                              'Content-Type': 'application/json'})
+                                     headers=hdrs)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, resp.read()
@@ -307,6 +312,51 @@ class WindowTests(unittest.TestCase):
         hits = sorted(proxy.state.hits)
         self.assertLess(hits[1] - hits[0], 0.3,
                         'different conversations should still run in parallel')
+
+    def test_header_session_key_serializes_different_messages(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=10,
+                          max_per_session=1, session_key='header')
+        proxy.state.delay = 0.5
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(proxy.chat, content='one',
+                            headers={'X-Session-Id': 'same-conversation'}),
+                pool.submit(proxy.chat, content='two',
+                            headers={'X-Session-Id': 'same-conversation'}),
+            ]
+            results = [f.result() for f in futures]
+        self.assertEqual([s for s, _ in results], [200, 200])
+        hits = sorted(proxy.state.hits)
+        self.assertGreaterEqual(hits[1] - hits[0], 0.4,
+                                'X-Session-Id must serialize different messages')
+
+    def test_ip_session_key_serializes_different_messages(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=5.0, limit=3, max_wait=10,
+                          max_per_session=1, session_key='ip')
+        proxy.state.delay = 0.5
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(proxy.chat, content='one'),
+                       pool.submit(proxy.chat, content='two')]
+            results = [f.result() for f in futures]
+        self.assertEqual([s for s, _ in results], [200, 200])
+        hits = sorted(proxy.state.hits)
+        self.assertGreaterEqual(hits[1] - hits[0], 0.4,
+                                'ip mode must serialize same-source requests')
+
+    def test_short_non_streaming_request_uses_aux(self):
+        accounts = {
+            'accounts': [{'access_key_id': 'ak1', 'secret_access_key': 'sk1'}],
+            'aux_accounts': [{'access_key_id': 'ak2', 'secret_access_key': 'sk2'}],
+        }
+        proxy = self.make(accounts, window=5.0, limit=3, max_wait=5)
+        proxy.chat(content='hello there')
+        proxy.chat(content='hi', stream=False)
+        ids = proxy.state.session_ids
+        self.assertEqual(len(ids), 2)
+        self.assertNotEqual(ids[0], ids[1],
+                            'short non-streaming request should use aux_accounts')
 
     def test_aux_requests_use_aux_accounts(self):
         accounts = {

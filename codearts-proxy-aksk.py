@@ -87,6 +87,12 @@ MAX_PER_WINDOW = max(1, int(cfg('PROXY_MAX_PER_WINDOW', '3')))
 # Serialize one client conversation so its companion requests (title, summary,
 # suggestions) cannot occupy several upstream sessions at once. 0 disables it.
 MAX_PER_SESSION = max(0, int(cfg('PROXY_MAX_PER_SESSION', '1')))
+# How to identify a conversation: auto (header -> body -> messages), header,
+# messages, or ip. 'ip' is the most reliable for a single-user proxy; behind a
+# gateway every request shares the gateway IP, so it serializes everything.
+SESSION_KEY_MODE = cfg('PROXY_SESSION_KEY', 'auto').strip().lower()
+if SESSION_KEY_MODE not in ('auto', 'header', 'messages', 'ip'):
+    SESSION_KEY_MODE = 'auto'
 # How long a client request may wait for a session lease before 429. 0 = no cap.
 MAX_WAIT = float(cfg('PROXY_MAX_WAIT_SECONDS', '120'))
 # Retries on TM.00001041. A retry costs another lease and another window slot,
@@ -101,6 +107,9 @@ AUX_KEYWORDS = tuple(
                     'title,summary,suggest,follow-up,标题,摘要,推荐,续写建议').split(',')
     if item.strip()
 )
+# A short non-streaming request (messages text at most this many chars) is also
+# treated as auxiliary. 0 disables the rule.
+AUX_MAX_CHARS = max(0, int(cfg('PROXY_AUX_MAX_CHARS', '200')))
 RETRY_DELAYS = [
     float(x) for x in cfg('PROXY_RETRY_DELAYS', '5,15').split(',') if x.strip()
 ]
@@ -239,6 +248,9 @@ def reserve_send(accounts=None, cancel=None):
         for account in accounts:
             wait = account.try_reserve(now)
             if wait <= 0:
+                elapsed = time.monotonic() - start
+                if elapsed >= 0.1:
+                    print(f'[lease] waited {elapsed:.1f}s', file=sys.stderr, flush=True)
                 return account
             waits.append(wait)
         wait = min(waits)
@@ -257,20 +269,25 @@ _SESSION_STATE = {}
 _SESSION_STATE_LOCK = threading.Lock()
 
 
-def _session_key(req, headers):
-    """Identify the client conversation so its requests run one at a time."""
-    for name in ('X-Session-Id', 'Chat-Id', 'Session-Id',
-                 'X-Conversation-Id', 'Conversation-Id'):
-        value = headers.get(name) if headers else None
-        if value:
-            return value.strip()[:64]
-    for name in ('conversation_id', 'chat_id', 'session_id'):
-        value = req.get(name)
-        if value:
-            return str(value)[:64]
+def _session_key(req, headers, client_ip=None):
+    """Return (key, source) identifying the client conversation."""
+    if SESSION_KEY_MODE in ('auto', 'header'):
+        for name in ('X-Session-Id', 'Chat-Id', 'Session-Id',
+                     'X-Conversation-Id', 'Conversation-Id'):
+            value = headers.get(name) if headers else None
+            if value:
+                return value.strip()[:64], 'header'
+        for name in ('conversation_id', 'chat_id', 'session_id'):
+            value = req.get(name)
+            if value:
+                return str(value)[:64], 'body'
+        if SESSION_KEY_MODE == 'header':
+            return None, 'none'
+    if SESSION_KEY_MODE == 'ip':
+        return (str(client_ip) if client_ip else 'unknown')[:64], 'ip'
     messages = req.get('messages') or []
     if not messages:
-        return None
+        return None, 'none'
     digest = hashlib.sha256()
     for message in messages[:2]:
         digest.update(str(message.get('role', '')).encode('utf-8'))
@@ -279,13 +296,13 @@ def _session_key(req, headers):
             digest.update(content.encode('utf-8'))
         else:
             digest.update(json.dumps(content, sort_keys=True).encode('utf-8'))
-    return 'msgs-' + digest.hexdigest()[:16]
+    return 'msgs-' + digest.hexdigest()[:16], 'messages'
 
 
 def acquire_session(key, cancel=None):
-    """Take the per-conversation slot. Returns an entry for release_session."""
+    """Take the per-conversation slot. Returns ((key, sem), wait_seconds)."""
     if not key or MAX_PER_SESSION <= 0:
-        return None
+        return None, 0.0
     with _SESSION_STATE_LOCK:
         state = _SESSION_STATE.get(key)
         if state is None:
@@ -294,14 +311,14 @@ def acquire_session(key, cancel=None):
         state['refs'] += 1
         sem = state['sem']
     acquired = False
+    start = time.monotonic()
     try:
-        start = time.monotonic()
         while True:
             if cancel is not None and cancel.is_set():
                 raise ClientGone()
             if sem.acquire(timeout=0.2):
                 acquired = True
-                return (key, sem)
+                return (key, sem), time.monotonic() - start
             if MAX_WAIT > 0 and time.monotonic() - start >= MAX_WAIT:
                 raise QueueTimeout(WINDOW)
     finally:
@@ -336,6 +353,9 @@ def _is_aux_request(req):
         if isinstance(content, str):
             text += content.lower() + ' '
     if AUX_KEYWORDS and any(word in text for word in AUX_KEYWORDS):
+        return True
+    if (AUX_MAX_CHARS and req.get('stream') is False
+            and len(messages) <= 2 and len(text) <= AUX_MAX_CHARS):
         return True
     if not AUX_MAX_TOKENS:
         return False
@@ -624,7 +644,9 @@ class Handler(BaseHTTPRequestHandler):
                 'window_seconds': WINDOW,
                 'max_per_window': MAX_PER_WINDOW,
                 'max_per_session': MAX_PER_SESSION,
+                'session_key': SESSION_KEY_MODE,
                 'aux_accounts': len(AUX_ACCOUNTS),
+                'aux_max_chars': AUX_MAX_CHARS,
                 'used': [a.used(now) for a in ACCOUNTS],
                 'max_wait_seconds': MAX_WAIT,
                 'max_active': MAX_ACTIVE,
@@ -676,9 +698,14 @@ class Handler(BaseHTTPRequestHandler):
         session = None
         try:
             try:
-                session = acquire_session(_session_key(req, self.headers), cancel)
+                key, key_source = _session_key(req, self.headers, self.client_address[0])
                 aux = _is_aux_request(req)
                 accounts = AUX_ACCOUNTS if (aux and AUX_ACCOUNTS) else PRIMARY_ACCOUNTS
+                session, session_wait = acquire_session(key, cancel)
+                if session_wait >= 0.1 or aux:
+                    print(f'[session] key={key[:12] if key else "-"} source={key_source} '
+                          f'wait={session_wait:.1f}s aux={int(aux)} '
+                          f'accounts={len(accounts)}', file=sys.stderr, flush=True)
                 account, uresp = call_upstream(upstream_body, cancel, accounts)
             except ClientGone:
                 return

@@ -98,15 +98,39 @@ primary account to itself:
 | `PROXY_WINDOW_SECONDS` | `60` | linger after a response ends, per account |
 | `PROXY_MAX_PER_WINDOW` | `3` | max live sessions per account (in flight + linger); set 2 to leave a slot for other clients |
 | `PROXY_MAX_PER_SESSION` | `1` | max in-flight requests per conversation (`0` disables serialization) |
+| `PROXY_SESSION_KEY` | `auto` | conversation key source: `auto`, `header`, `messages`, `ip` |
 | `PROXY_MAX_WAIT_SECONDS` | `120` | max queue time before 429 (`0` = wait forever) |
 | `PROXY_SESSION_RETRIES` | `0` | retries on `TM.00001041` (each retry costs a slot) |
 | `PROXY_AUX_MAX_TOKENS` | `256` | `max_tokens` at or below this marks a request as auxiliary |
+| `PROXY_AUX_MAX_CHARS` | `200` | short non-streaming request (messages text at most this many chars) goes to aux; `0` disables |
 | `PROXY_AUX_KEYWORDS` | `title,summary,suggest,follow-up,标题,摘要,推荐,续写建议` | prompt keywords that mark a request as auxiliary |
 | `PROXY_RETRY_DELAYS` | `5,15` | backoff before each retry |
 | `PROXY_MAX_ACTIVE` | `64` | max concurrent client requests |
 | `PROXY_UPSTREAM_TIMEOUT` | `300` | upstream read timeout in seconds |
 
 These can go in `codearts-proxy-aksk.env` or in the systemd unit.
+
+### Why a conversation still runs in parallel
+
+The proxy logs one line per request that waited or was routed:
+
+```text
+[session] key=msgs-1a2b3c4d source=messages wait=12.3s aux=0 accounts=1
+[lease] waited 4.1s
+```
+
+- `[session] wait=` means the request waited on the per-conversation slot.
+- `[lease] waited` means the account window was full; add accounts.
+- `source=messages` with different keys for the same conversation means the
+  client does not send a session header and its first two messages change.
+  Fix it by sending `Chat-Id`/`X-Session-Id`, by setting
+  `PROXY_SESSION_KEY=header`, or — for a single-user proxy — by using
+  `PROXY_SESSION_KEY=ip`.
+- `aux=1` shows the request was routed to `aux_accounts`.
+
+`PROXY_SESSION_KEY=ip` serializes everything from one source IP. That is the
+right choice for a single user, but behind a shared gateway every request has
+the gateway IP, so it serializes all users.
 
 ### Latency (time to first byte)
 
