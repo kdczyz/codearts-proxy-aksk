@@ -106,6 +106,11 @@ RETRIES = max(0, int(cfg('PROXY_SESSION_RETRIES', '0')))
 # arrives after generation (~5-15 s) instead of after the queue (~45-60 s).
 NONSTREAM_FALLBACK = cfg('PROXY_NONSTREAM_FALLBACK', '1').strip().lower() not in (
     '0', 'false', 'no')
+# Seconds a converted non-stream call may run before giving up and switching
+# to the queued streaming path. Huawei's gateway returns 504 (APIG.0203) at
+# ~60 s with no response bytes, so stay below it; streaming survives past
+# 60 s total (measured 68.6 s) because chunks keep flowing.
+NONSTREAM_TIMEOUT = float(cfg('PROXY_NONSTREAM_TIMEOUT', '55'))
 # Auxiliary requests (title/summary/suggestions) are routed to aux_accounts
 # when configured, so they never compete with the main conversation.
 AUX_MAX_TOKENS = max(0, int(cfg('PROXY_AUX_MAX_TOKENS', '256')))
@@ -479,7 +484,7 @@ class _FallbackToQueue(Exception):
     """Non-stream fallback hit the session limit; use the queued path."""
 
 
-def _post_upstream(account, body):
+def _post_upstream(account, body, timeout=None):
     headers = sign(account.ak, account.sk, 'POST', SNAP_URL, body)
     # Session headers are added after signing (not part of the canonical
     # request). Chat-Id and Session-Id stay stable per account: a fresh id per
@@ -490,6 +495,18 @@ def _post_upstream(account, body):
     headers['Connection'] = 'keep-alive'
     for attempt in range(2):
         conn = POOL.acquire()
+        if timeout is not None:
+            # Per-operation socket timeout for this call only. A pooled
+            # connection keeps it afterwards; 55 s per recv is harmless for
+            # streaming (chunks arrive constantly) and the converted caller
+            # restores the default after a successful read.
+            try:
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                else:
+                    conn.timeout = timeout
+            except Exception:
+                pass
         try:
             conn.request('POST', _UPSTREAM_PATH, body=body, headers=headers)
             resp = conn.getresponse()
@@ -675,6 +692,7 @@ class Handler(BaseHTTPRequestHandler):
                 'aux_max_chars': AUX_MAX_CHARS,
                 'used': [a.used(now) for a in ACCOUNTS],
                 'nonstream_fallback': NONSTREAM_FALLBACK,
+                'nonstream_timeout': NONSTREAM_TIMEOUT,
                 'max_wait_seconds': MAX_WAIT,
                 'max_active': MAX_ACTIVE,
             })
@@ -798,24 +816,44 @@ class Handler(BaseHTTPRequestHandler):
         upstream_req['stream'] = False
         body = json.dumps(upstream_req).encode()
         account = min(accounts, key=lambda a: a.used(time.monotonic()))
+        uresp = None
         try:
-            uresp = _post_upstream(account, body)
+            uresp = _post_upstream(account, body, timeout=NONSTREAM_TIMEOUT)
         except urllib.error.HTTPError as e:
             err_body = e.read()
             _log_upstream_error(e.code, err_body)
-            if b'TM.00001041' in err_body:
+            if b'TM.00001041' in err_body or e.code == 504:
+                # 504 is Huawei's gateway timeout (~60 s, no bytes yet):
+                # the queued streaming path survives it, first token is fast
+                # and chunks keep flowing past 60 s.
                 raise _FallbackToQueue()
             self._send_json(e.code, {'error': {'message': 'upstream error',
                                                'type': 'server_error'}})
             return
+        except (TimeoutError, socket.timeout) as e:
+            print(f'[fallback] non-stream timed out after '
+                  f'{NONSTREAM_TIMEOUT:.0f}s, switching to streaming',
+                  file=sys.stderr, flush=True)
+            raise _FallbackToQueue()
         except Exception as e:
             self._send_json(502, {'error': f'upstream error: {e}'})
             return
         try:
             raw = uresp.read()
+        except (TimeoutError, socket.timeout):
+            print(f'[fallback] non-stream read timed out after '
+                  f'{NONSTREAM_TIMEOUT:.0f}s, switching to streaming',
+                  file=sys.stderr, flush=True)
+            raise _FallbackToQueue()
         finally:
             try:
-                uresp.close()
+                if uresp is not None and uresp._conn.sock is not None:
+                    uresp._conn.sock.settimeout(UPSTREAM_TIMEOUT)
+            except Exception:
+                pass
+            try:
+                if uresp is not None:
+                    uresp.close()
             except Exception:
                 pass
         try:

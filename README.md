@@ -60,7 +60,12 @@ What the proxy does:
   request finds no lease free, the proxy sends it non-stream instead of
   queueing for the 60 s linger, then re-emits the reply as SSE
   (`PROXY_NONSTREAM_FALLBACK=1`, default on; `[fallback]` in the log). First
-  token then arrives after generation instead of after the queue;
+  token then arrives after generation instead of after the queue. But a
+  non-stream call sends no bytes until generation finishes, and Huawei's
+  gateway returns 504 (APIG.0203, backend timeout) at ~60 s, so the fallback
+  gives up after `PROXY_NONSTREAM_TIMEOUT` (default 55 s) and switches to the
+  queued streaming path, which survives past 60 s (measured 68.6 s) because
+  its chunks keep flowing; an upstream 504 does the same switch;
 - queued requests are cancelled as soon as the client disconnects, and an
   in-flight upstream response is closed too, so the upstream stops generating
   and releases its session within ~200 ms;
@@ -114,6 +119,7 @@ primary account to itself:
 | `PROXY_RETRY_DELAYS` | `5,15` | backoff before each retry |
 | `PROXY_MAX_ACTIVE` | `64` | max concurrent client requests |
 | `PROXY_UPSTREAM_TIMEOUT` | `300` | upstream read timeout in seconds |
+| `PROXY_NONSTREAM_TIMEOUT` | `55` | seconds a converted non-stream call may run before switching to streaming (Huawei gateway 504s at ~60 s) |
 
 These can go in `codearts-proxy-aksk.env` or in the systemd unit.
 

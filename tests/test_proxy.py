@@ -32,6 +32,7 @@ class MockState:
         self.ports = []
         self.session_ids = []
         self.stream_flags = []
+        self.fail_next_504 = 0
         self.slow_after_first = False
         self.slow_delay = 0.0
         self.aborted = False
@@ -66,6 +67,17 @@ class MockHandler(BaseHTTPRequestHandler):
             data = json.dumps({'error_code': 'TM.00001041',
                                'error_msg': 'session limit'}).encode()
             self.send_response(400)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if stream_flag is False and self.state.fail_next_504 > 0:
+            with self.state.lock:
+                self.state.fail_next_504 -= 1
+            data = json.dumps({'error_msg': 'Backend timeout',
+                               'error_code': 'APIG.0203'}).encode()
+            self.send_response(504)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
@@ -135,7 +147,8 @@ def free_port():
 
 class ProxyFixture:
     def __init__(self, accounts, window, limit, max_wait, retries=0,
-                 retry_delays='0.2', max_per_session=0, session_key='auto'):
+                 retry_delays='0.2', max_per_session=0, session_key='auto',
+                 nonstream_timeout=None):
         self.accounts = accounts
         self.window = window
         self.limit = limit
@@ -144,6 +157,7 @@ class ProxyFixture:
         self.retry_delays = retry_delays
         self.max_per_session = max_per_session
         self.session_key = session_key
+        self.nonstream_timeout = nonstream_timeout
         self.tmp = tempfile.mkdtemp(prefix='proxy-test-')
 
     def start(self):
@@ -178,6 +192,8 @@ class ProxyFixture:
             'PROXY_RETRY_DELAYS': self.retry_delays,
             'PROXY_UPSTREAM_TIMEOUT': '10',
         })
+        if self.nonstream_timeout is not None:
+            env['PROXY_NONSTREAM_TIMEOUT'] = str(self.nonstream_timeout)
         self.env = env
         self.proc = subprocess.Popen([sys.executable, SCRIPT], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -392,6 +408,45 @@ class WindowTests(unittest.TestCase):
         # And a non-stream client request still works through the normal path.
         status, body = proxy.chat(content='plain')
         self.assertEqual(status, 200)
+
+    def test_nonstream_504_falls_back_to_queued_stream(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=2.0, limit=3, max_wait=10, max_per_session=1)
+        proxy.state.delay = 0.3
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(
+                lambda i: proxy.chat(content=f'fill-{i}', stream=True), range(3)))
+        self.assertEqual([s for s, _ in results], [200, 200, 200])
+        proxy.state.fail_next_504 = 1
+        start = time.monotonic()
+        status, body = proxy.chat(content='overflow', stream=True)
+        elapsed = time.monotonic() - start
+        self.assertEqual(status, 200)
+        self.assertIn(b'ok', body)
+        self.assertGreaterEqual(elapsed, 1.0,
+                                '504 fallback must wait for a lease, not '
+                                'return the 504')
+        self.assertLess(elapsed, 8.0)
+        self.assertIn(False, proxy.state.stream_flags,
+                      'fallback must try stream=false upstream first')
+
+    def test_nonstream_timeout_falls_back_to_queued_stream(self):
+        proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
+                          window=2.0, limit=3, max_wait=10, max_per_session=1,
+                          nonstream_timeout=0.3)
+        proxy.state.delay = 1.0
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = list(pool.map(
+                lambda i: proxy.chat(content=f'fill-{i}', stream=True), range(3)))
+        self.assertEqual([s for s, _ in results], [200, 200, 200])
+        start = time.monotonic()
+        status, body = proxy.chat(content='overflow', stream=True)
+        elapsed = time.monotonic() - start
+        self.assertEqual(status, 200)
+        self.assertIn(b'ok', body)
+        self.assertLess(elapsed, 8.0)
+        self.assertIn(False, proxy.state.stream_flags,
+                      'timed-out fallback must have tried stream=false')
 
     def test_header_session_key_serializes_different_messages(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
