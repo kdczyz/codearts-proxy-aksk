@@ -697,16 +697,6 @@ _SERVER = []
 class Handler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
-    def handle_one_request(self):
-        global _IN_FLIGHT
-        with _IN_FLIGHT_LOCK:
-            _IN_FLIGHT += 1
-        try:
-            super().handle_one_request()
-        finally:
-            with _IN_FLIGHT_LOCK:
-                _IN_FLIGHT -= 1
-
     def setup(self):
         super().setup()
         try:
@@ -756,11 +746,12 @@ class Handler(BaseHTTPRequestHandler):
                 'aux_accounts': len(AUX_ACCOUNTS),
                 'aux_max_chars': AUX_MAX_CHARS,
                 'used': [a.used(now) for a in ACCOUNTS],
-                # Requests currently being handled (streaming, fallback and
-                # queued). Deploy only when this is 0: host-side `ss` cannot
-                # see new-api's connections (they live in the container's
-                # net namespace), so it wrongly reported a quiet moment on
-                # 2026-11-23 and a restart killed a 4-minute DSH request.
+                # Chat requests currently being handled (streaming,
+                # fallback and queued). Deploy only when this is 0. Host-side
+                # `ss` cannot see new-api's connections (they live in the
+                # container's net namespace), so it wrongly reported a quiet
+                # moment on 2026-11-23 and a restart killed a 4-minute DSH
+                # request; idle keep-alive connections are not counted.
                 'in_flight': _IN_FLIGHT,
                 'nonstream_fallback': NONSTREAM_FALLBACK,
                 'nonstream_timeout': NONSTREAM_TIMEOUT,
@@ -771,6 +762,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {'error': 'not found'})
 
     def do_POST(self):
+        # Count only requests actually being served. Counting in
+        # handle_one_request also counted idle keep-alive connections,
+        # which made in_flight never reach 0 (see above).
+        global _IN_FLIGHT
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT += 1
+        try:
+            self._do_post_impl()
+        finally:
+            with _IN_FLIGHT_LOCK:
+                _IN_FLIGHT -= 1
+
+    def _do_post_impl(self):
         if self.path not in ('/v1/chat/completions', '/chat/completions'):
             self._send_json(404, {'error': 'not found'})
             return
