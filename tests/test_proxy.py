@@ -165,7 +165,7 @@ class ProxyFixture:
     def __init__(self, accounts, window, limit, max_wait, retries=0,
                  retry_delays='0.2', max_per_session=0, session_key='auto',
                  nonstream_timeout=None, upstream_timeout=None,
-                 first_byte_timeout=None):
+                 first_byte_timeout=None, drain_seconds=None):
         self.accounts = accounts
         self.window = window
         self.limit = limit
@@ -177,6 +177,7 @@ class ProxyFixture:
         self.nonstream_timeout = nonstream_timeout
         self.upstream_timeout = upstream_timeout
         self.first_byte_timeout = first_byte_timeout
+        self.drain_seconds = drain_seconds
         self.tmp = tempfile.mkdtemp(prefix='proxy-test-')
 
     def start(self):
@@ -217,6 +218,8 @@ class ProxyFixture:
             env['PROXY_NONSTREAM_TIMEOUT'] = str(self.nonstream_timeout)
         if self.first_byte_timeout is not None:
             env['PROXY_FIRST_BYTE_TIMEOUT'] = str(self.first_byte_timeout)
+        if self.drain_seconds is not None:
+            env['PROXY_DRAIN_SECONDS'] = str(self.drain_seconds)
         self.env = env
         self.proc = subprocess.Popen([sys.executable, SCRIPT], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -689,7 +692,7 @@ class GracefulShutdownTests(unittest.TestCase):
     def test_sigterm_waits_for_in_flight_request(self):
         proxy = self.make([{'access_key_id': 'ak', 'secret_access_key': 'sk'}],
                           window=60.0, limit=3, max_wait=10,
-                          max_per_session=1)
+                          max_per_session=1, drain_seconds=10)
         proxy.state.delay = 2.0
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(proxy.chat, content='slow', stream=True)

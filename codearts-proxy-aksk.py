@@ -691,7 +691,13 @@ _IN_FLIGHT = 0
 _IN_FLIGHT_LOCK = threading.Lock()
 # DSH's longest generations run ~130 s, so the drain must outlast them;
 # systemd's TimeoutStopSec (drop-in, 200 s) must stay above this cap.
-_DRAIN_SECONDS = 180.0
+# How long a SIGTERM waits for in-flight requests before exiting. Default
+# 0 (exit at once): a long drain closes the listening socket, so every new
+# request is refused for the whole drain - on 2026-11-23 a 180 s drain
+# refused all new connections for ~3 minutes and failed DSH's round, which
+# is far worse than the 1-2 in-flight requests it saved (DSH retries those).
+# Exiting at once limits the restart gap to ~1-2 s (process startup).
+_DRAIN_SECONDS = float(cfg('PROXY_DRAIN_SECONDS', '0'))
 _SHUTDOWN_REQUESTED = threading.Event()
 
 
